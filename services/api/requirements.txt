@@ -1,0 +1,5 @@
+# services/api/requirements.txt
+fastapi
+mangum
+pydantic
+boto3

@@ -1,0 +1,1 @@
+{ "app": "npx ts-node --project tsconfig.json infra/main.ts" }
