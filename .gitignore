@@ -1,0 +1,9 @@
+# node / python / infra artifacts
+node_modules
+.package-lock.json
+.venv
+__pycache__/
+.pytest_cache/
+cdk.out/
+dist/
+.env

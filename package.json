@@ -1,0 +1,31 @@
+{
+  "name": "metricfoundry",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "tsc -p .",
+    "cdk:synth": "npm run build && cdk synth",
+    "cdk:deploy": "npm run build && cdk deploy --all",
+    "cdk:diff": "npm run build && cdk diff"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.155",
+    "@types/node": "^24.7.0",
+    "aws-cdk": "^2.1029.4",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.219.0",
+    "constructs": "^10.4.2"
+  }
+}
