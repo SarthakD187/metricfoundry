@@ -2,6 +2,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import boto3, os, uuid, time
+from botocore.exceptions import ClientError
 from mangum import Mangum
 
 # ---- Env ----
@@ -89,6 +90,13 @@ def get_job(job_id: str):
 @app.get("/jobs/{job_id}/results")
 def get_job_results(job_id: str):
     key = f"artifacts/{job_id}/results/results.json"
+    try:
+        s3.head_object(Bucket=BUCKET_NAME, Key=key)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code in ("404", "NotFound", "NoSuchKey"):
+            raise HTTPException(status_code=404, detail="Results not available")
+        raise HTTPException(status_code=502, detail="Unable to verify results availability")
     url = s3.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": BUCKET_NAME, "Key": key},
