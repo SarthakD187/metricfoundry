@@ -218,15 +218,22 @@ def main(event, _ctx):
 
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
-        body = obj["Body"].read()
-
-        result = run_pipeline(
-            job_id,
-            {"bucket": bucket, "key": key},
-            body,
-            artifact_prefix=artifact_prefix,
-            on_phase=_default_callback(job_id),
-        )
+        body = obj["Body"]
+        try:
+            result = run_pipeline(
+                job_id,
+                {"bucket": bucket, "key": key},
+                body,
+                artifact_prefix=artifact_prefix,
+                on_phase=_default_callback(job_id),
+            )
+        finally:
+            closer = getattr(body, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    pass
 
         target_bucket = ARTIFACTS_BUCKET or bucket
         artifact_keys = _persist_pipeline_outputs(job_id, target_bucket, result)
