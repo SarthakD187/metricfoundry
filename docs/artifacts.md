@@ -41,6 +41,7 @@ phases:
   samples.
 - `outliers.json` – detected outliers for numeric fields along with z-scores.
 - `report.txt` – natural-language summary for quick operator review.
+- `graphs/` – PNG visualizations such as histograms and scatter plots for quick exploration of numeric fields.
 
 Additional artifacts added by future phases (plots, models, etc.) should follow
 this pattern and be registered in the manifest under `artifacts/` with the

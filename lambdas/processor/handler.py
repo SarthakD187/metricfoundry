@@ -105,6 +105,13 @@ def _persist_artifact(bucket: str, key: str, spec: Mapping[str, Any]) -> None:
         headers = spec.get("headers", [])
         rows = spec.get("rows", [])
         body = _csv_bytes(list(headers), list(rows))
+    elif kind == "image":
+        data = spec.get("data", b"")
+        if isinstance(data, memoryview):  # pragma: no cover - defensive conversion
+            data = data.tobytes()
+        if not isinstance(data, (bytes, bytearray)):
+            raise ValueError("Image artifact data must be bytes-like")
+        body = bytes(data)
     else:
         raise ValueError(f"Unsupported artifact kind: {kind}")
     _put_object(bucket, key, body, content_type)
