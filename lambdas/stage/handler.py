@@ -126,18 +126,46 @@ def _detect_format(key: str, content_type: Optional[str]) -> str:
     name = key.lower()
     if name.endswith(".csv"):
         return "csv"
+    if name.endswith(".tsv") or name.endswith(".tab"):
+        return "tsv"
     if name.endswith(".jsonl") or name.endswith(".ndjson"):
         return "jsonl"
     if name.endswith(".json"):
         return "json"
+    if name.endswith(".xlsx") or name.endswith(".xls") or name.endswith(".xlsm"):
+        return "excel"
+    if name.endswith(".parquet") or name.endswith(".pq") or name.endswith(".pqt") or name.endswith(".parq"):
+        return "parquet"
+    if name.endswith(".sqlite") or name.endswith(".sqlite3") or name.endswith(".db"):
+        return "sqlite"
+    if name.endswith(".zip"):
+        return "zip"
+    if name.endswith(".tar.gz") or name.endswith(".tgz"):
+        return "tar"
+    if name.endswith(".tar"):
+        return "tar"
+    if name.endswith(".gz") or name.endswith(".gzip"):
+        return "gzip"
 
     if content_type:
         ct = content_type.lower()
         if "csv" in ct:
             return "csv"
+        if "tsv" in ct or "tab-separated" in ct:
+            return "tsv"
         if "json" in ct:
             # Handles generic JSON content types as a fallback.
             return "json"
+        if "spreadsheet" in ct or "ms-excel" in ct:
+            return "excel"
+        if "parquet" in ct:
+            return "parquet"
+        if "tar" in ct:
+            return "tar"
+        if "zip" in ct:
+            return "zip"
+        if "gzip" in ct:
+            return "gzip"
 
     return "unknown"
 
