@@ -97,10 +97,10 @@ export class MetricFoundryCoreStack extends Stack {
     // =====================================================================
     // Processor Lambda: invoked by Step Functions after staging completes
     // =====================================================================
-    const processorFn = new lambda.Function(this, "ProcessorFn", {
-      runtime: lambda.Runtime.PYTHON_3_12,
-      handler: "handler.main",
-      code: lambda.Code.fromAsset("lambdas/processor"),
+    const processorFn = new lambda.DockerImageFunction(this, "ProcessorFn", {
+      code: lambda.DockerImageCode.fromImageAsset(".", {
+        file: "lambdas/processor/Dockerfile",
+      }),
       timeout: Duration.minutes(2),
       memorySize: 1024,
       environment: {
