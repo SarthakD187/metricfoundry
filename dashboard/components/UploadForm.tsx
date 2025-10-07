@@ -18,7 +18,10 @@ export function UploadForm({ onJobCreated, onUploadFinished, onError }: UploadFo
     setFile(null);
     setS3Path('');
     if (typeof window !== 'undefined') {
-      (document.getElementById('dataset-file-input') as HTMLInputElement | null)?.value = '';
+      const input = document.getElementById('dataset-file-input');
+      if (input instanceof HTMLInputElement) {
+        input.value = '';
+      }
     }
   };
 
