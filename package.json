@@ -8,7 +8,7 @@
     "test": "tests"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "pytest services/api/tests",
     "build": "tsc -p .",
     "cdk:synth": "npm run build && cdk synth",
     "cdk:deploy": "npm run build && cdk deploy --all",
