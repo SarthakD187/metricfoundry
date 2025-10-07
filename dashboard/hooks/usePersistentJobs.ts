@@ -36,7 +36,7 @@ function reviveJobs(value: string | null, fallback: TrackedJob[]): TrackedJob[] 
   try {
     const parsed = JSON.parse(value) as TrackedJob[];
     if (!Array.isArray(parsed)) return fallback;
-    return parsed.map((job) => ({
+    return parsed.map((job: TrackedJob) => ({
       ...job,
       status: normaliseStatus(job.status),
     }));
@@ -58,18 +58,20 @@ export function usePersistentJobs(initial: TrackedJob[] = []) {
   }, [jobs]);
 
   const addJob = useCallback((job: TrackedJob) => {
-    setJobs((prev) => {
-      const existing = prev.find((item) => item.jobId === job.jobId);
+    setJobs((prev: TrackedJob[]) => {
+      const existing = prev.find((item: TrackedJob) => item.jobId === job.jobId);
       if (existing) {
-        return prev.map((item) => (item.jobId === job.jobId ? { ...existing, ...job } : item));
+        return prev.map((item: TrackedJob) =>
+          item.jobId === job.jobId ? { ...existing, ...job } : item,
+        );
       }
       return [{ ...job, status: normaliseStatus(job.status) }, ...prev];
     });
   }, []);
 
   const updateJob = useCallback((jobId: string, changes: Partial<TrackedJob>) => {
-    setJobs((prev) =>
-      prev.map((job) =>
+    setJobs((prev: TrackedJob[]) =>
+      prev.map((job: TrackedJob) =>
         job.jobId === jobId
           ? {
               ...job,
@@ -82,7 +84,7 @@ export function usePersistentJobs(initial: TrackedJob[] = []) {
   }, []);
 
   const removeJob = useCallback((jobId: string) => {
-    setJobs((prev) => prev.filter((job) => job.jobId !== jobId));
+    setJobs((prev: TrackedJob[]) => prev.filter((job: TrackedJob) => job.jobId !== jobId));
   }, []);
 
   const sortedJobs = useMemo(

@@ -8,6 +8,9 @@
     "test": "tests"
   },
   "scripts": {
+    "dev": "npm --prefix dashboard run dev",
+    "dashboard:install": "npm --prefix dashboard install",
+    "dashboard:dev": "npm --prefix dashboard run dev",
     "test": "pytest services/api/tests",
     "build": "tsc -p .",
     "cdk:synth": "npm run build && cdk synth",
