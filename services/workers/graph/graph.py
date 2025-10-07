@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import csv
 import gzip
 import io
@@ -13,7 +14,7 @@ import tarfile
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import IO, Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union, cast
 
 from langgraph.graph import END, StateGraph
 
@@ -37,6 +38,30 @@ _MAX_NUMERIC_ROW_SAMPLES = 500
 _MAX_AUTOML_ROWS = 2000
 _MAX_HISTOGRAMS = 8
 _MAX_SCATTERS = 3
+
+_DELIMITED_STREAM_CHUNK_SIZE = 64 * 1024
+
+
+BinaryInput = Union[bytes, bytearray, IO[bytes]]
+
+
+def _open_binary_stream(body: BinaryInput) -> Tuple[IO[bytes], bool]:
+    if isinstance(body, bytes):
+        return io.BytesIO(body), True
+    if isinstance(body, bytearray):
+        return io.BytesIO(bytes(body)), True
+    if hasattr(body, "read"):
+        return cast(IO[bytes], body), False
+    raise TypeError("body must be bytes-like or a binary stream")
+
+
+def _ensure_bytes(body: BinaryInput) -> bytes:
+    if isinstance(body, bytes):
+        return body
+    if isinstance(body, bytearray):
+        return bytes(body)
+    data = cast(IO[bytes], body).read()
+    return data
 
 
 _MATPLOTLIB_SETUP = False
@@ -274,6 +299,9 @@ class _DatasetBuilder:
 
         self.row_count += 1
 
+    def increment_bytes_read(self, amount: int) -> None:
+        self.bytes_read += amount
+
     def build(self) -> DatasetSummary:
         return DatasetSummary(
             row_count=self.row_count,
@@ -303,20 +331,56 @@ def _format_preview(value: Any) -> Any:
     return text
 
 
-def _ingest_delimited(key: str, body: bytes, delimiter: str, source_format: str) -> DatasetSummary:
-    text = body.decode("utf-8", errors="replace")
-    reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
-    builder = _DatasetBuilder(bytes_read=len(body), source_format=source_format)
-    for row in reader:
-        builder.process_row(row)
-    return builder.build()
+def _ingest_delimited(key: str, body: BinaryInput, delimiter: str, source_format: str) -> DatasetSummary:
+    stream, should_close = _open_binary_stream(body)
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    builder = _DatasetBuilder(bytes_read=0, source_format=source_format)
+    buffer = ""
+
+    def _iter_lines() -> Iterable[str]:
+        nonlocal buffer
+        while True:
+            chunk = stream.read(_DELIMITED_STREAM_CHUNK_SIZE)
+            if not chunk:
+                break
+            if isinstance(chunk, bytes):
+                data = chunk
+            elif isinstance(chunk, bytearray):
+                data = bytes(chunk)
+            else:
+                raise TypeError(f"Delimited dataset chunk from {key} must be bytes-like")
+            builder.increment_bytes_read(len(data))
+            decoded = decoder.decode(data)
+            if decoded:
+                buffer += decoded
+            while True:
+                newline_index = buffer.find("\n")
+                if newline_index == -1:
+                    break
+                line = buffer[: newline_index + 1]
+                yield line
+                buffer = buffer[newline_index + 1 :]
+        remainder = decoder.decode(b"", final=True)
+        if remainder:
+            buffer += remainder
+        if buffer:
+            yield buffer
+
+    try:
+        reader = csv.DictReader(_iter_lines(), delimiter=delimiter)
+        for row in reader:
+            builder.process_row(row)
+        return builder.build()
+    finally:
+        if should_close:
+            stream.close()
 
 
-def _ingest_csv(key: str, body: bytes) -> DatasetSummary:
+def _ingest_csv(key: str, body: BinaryInput) -> DatasetSummary:
     return _ingest_delimited(key, body, ",", "csv")
 
 
-def _ingest_tsv(key: str, body: bytes) -> DatasetSummary:
+def _ingest_tsv(key: str, body: BinaryInput) -> DatasetSummary:
     return _ingest_delimited(key, body, "\t", "tsv")
 
 
@@ -534,30 +598,30 @@ def _strip_compression_suffix(name: str) -> str:
     return name
 
 
-def ingest_dataset(key: str, body: bytes) -> DatasetSummary:
+def ingest_dataset(key: str, body: BinaryInput) -> DatasetSummary:
     lowered = key.lower()
     if lowered.endswith(".zip"):
-        return _ingest_zip(key, body)
+        return _ingest_zip(key, _ensure_bytes(body))
     if lowered.endswith(".tar") or lowered.endswith(".tar.gz") or lowered.endswith(".tgz"):
-        return _ingest_tar(key, body)
+        return _ingest_tar(key, _ensure_bytes(body))
     if lowered.endswith(".gz") or lowered.endswith(".gzip"):
         try:
-            decompressed = gzip.decompress(body)
+            decompressed = gzip.decompress(_ensure_bytes(body))
         except OSError as exc:
             raise ValueError(f"Invalid GZIP payload: {key}") from exc
         return ingest_dataset(_strip_compression_suffix(key), decompressed)
     if lowered.endswith(".parquet") or lowered.endswith(".pq") or lowered.endswith(".pqt") or lowered.endswith(".parq"):
-        return _ingest_parquet(body)
+        return _ingest_parquet(_ensure_bytes(body))
     if lowered.endswith(".xlsx") or lowered.endswith(".xls") or lowered.endswith(".xlsm"):
-        return _ingest_excel(body)
+        return _ingest_excel(_ensure_bytes(body))
     if lowered.endswith(".sqlite") or lowered.endswith(".sqlite3") or lowered.endswith(".db"):
-        return _ingest_sqlite(body)
+        return _ingest_sqlite(_ensure_bytes(body))
     if lowered.endswith(".tsv") or lowered.endswith(".tab"):
         return _ingest_tsv(key, body)
     if lowered.endswith(".jsonl") or lowered.endswith(".ndjson"):
-        return _ingest_jsonl(body)
+        return _ingest_jsonl(_ensure_bytes(body))
     if lowered.endswith(".json"):
-        return _ingest_json(body)
+        return _ingest_json(_ensure_bytes(body))
     return _ingest_csv(key, body)
 
 
@@ -580,8 +644,16 @@ def _emit_callback(state: Mapping[str, Any], phase: str, payload: Mapping[str, A
 def ingest_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
     source = state.get("source", {})
     key = source.get("key", "dataset.csv")
-    body: bytes = state.get("raw_input", b"")
-    dataset = ingest_dataset(key, body)
+    body_input = state.get("raw_input", b"")
+    try:
+        dataset = ingest_dataset(key, body_input)
+    finally:
+        closer = getattr(body_input, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:
+                pass
 
     payload = {
         "rows": dataset.row_count,
@@ -1645,7 +1717,7 @@ PIPELINE = builder.compile()
 def run_pipeline(
     job_id: str,
     source: Mapping[str, Any],
-    body: bytes,
+    body: BinaryInput,
     *,
     artifact_prefix: str,
     on_phase: Optional[PhaseCallback] = None,

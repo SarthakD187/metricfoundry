@@ -124,6 +124,35 @@ def _sqlite_bytes(rows: Iterable[dict]) -> bytes:
             pass
 
 
+class _ChunkedBinaryStream:
+    def __init__(self, payload: bytes, chunk_size: int = 8192) -> None:
+        self._payload = payload
+        self._chunk_size = chunk_size
+        self._index = 0
+        self.closed = False
+
+    def read(self, size: int = -1) -> bytes:
+        if self.closed:
+            return b""
+        if size is None or size < 0:
+            size = self._chunk_size
+        else:
+            size = min(size, self._chunk_size)
+        if size == 0 or self._index >= len(self._payload):
+            self._index = len(self._payload)
+            return b""
+        end = min(len(self._payload), self._index + size)
+        chunk = self._payload[self._index : end]
+        self._index = end
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+    def readable(self) -> bool:
+        return True
+
+
 _ensure_state_graph_stub()
 module = importlib.import_module("services.workers.graph.graph")
 importlib.reload(module)
@@ -171,3 +200,17 @@ def test_pipeline_ingests_diverse_formats(key, body, expected_format):
 
     summary = result.phases["nl_report"]["summary"]
     assert f"{len(SAMPLE_ROWS)} rows" in summary
+
+
+def test_pipeline_streams_delimited_input_without_full_decode():
+    payload = _csv_bytes(SAMPLE_ROWS)
+    stream = _ChunkedBinaryStream(payload, chunk_size=7)
+    job_id = "job-streaming"
+
+    result = run_pipeline(job_id, {"key": "stream.csv"}, stream, artifact_prefix=f"artifacts/{job_id}")
+
+    ingest = result.phases["ingest"]
+    assert ingest["rows"] == len(SAMPLE_ROWS)
+    assert ingest["sourceFormat"] == "csv"
+    assert ingest["bytesRead"] == len(payload)
+    assert stream.closed is True
