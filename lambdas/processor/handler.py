@@ -1,11 +1,14 @@
+import csv
+import io
 import json
 import os
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Protocol
+from typing import Any, Dict, Mapping
 
 import boto3
 from botocore.exceptions import ClientError
+
+from services.workers.graph.graph import PHASE_ORDER, PipelineResult, run_pipeline
 
 s3 = boto3.client("s3")
 ddb = boto3.resource("dynamodb")
@@ -16,6 +19,8 @@ ARTIFACTS_BUCKET = os.environ.get("ARTIFACTS_BUCKET")
 STATUS_RUNNING = "RUNNING"
 STATUS_SUCCEEDED = "SUCCEEDED"
 STATUS_FAILED = "FAILED"
+
+ANALYSIS_VERSION = "2024.05"
 
 
 def ddb_table():
@@ -48,6 +53,18 @@ def result_key_for(job_id: str) -> str:
     return f"artifacts/{job_id}/results/results.json"
 
 
+def manifest_key_for(job_id: str) -> str:
+    return f"artifacts/{job_id}/results/manifest.json"
+
+
+def phase_key_for(job_id: str, phase: str) -> str:
+    return f"artifacts/{job_id}/phases/{phase}.json"
+
+
+def artifact_key_for(job_id: str, relative: str) -> str:
+    return f"artifacts/{job_id}/{relative}"
+
+
 def object_exists(bucket: str, key: str) -> bool:
     try:
         s3.head_object(Bucket=bucket, Key=key)
@@ -59,198 +76,101 @@ def object_exists(bucket: str, key: str) -> bool:
         raise
 
 
-_NULL_SENTINELS = {None, "", "null", "NULL", "NaN", "nan"}
-
-ANALYSIS_VERSION = "2024.05"
-
-
-@dataclass
-class DatasetDescriptor:
-    """Lightweight summary of the ingested dataset."""
-
-    rows: int | None
-    columns: List[str]
-    null_counts: Dict[str, int]
+def _json_bytes(data: Any) -> bytes:
+    return json.dumps(data, indent=2, default=str).encode("utf-8")
 
 
-class AnalyticsContext:
-    """Shared state that steps can use to communicate results."""
-
-    def __init__(self, job_id: str, source_key: str, dataset: DatasetDescriptor):
-        self.job_id = job_id
-        self.source_key = source_key
-        self.dataset = dataset
-        self.results: Dict[str, Dict[str, Any]] = {}
-
-    def record(self, step_name: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
-        result = dict(payload)
-        self.results[step_name] = result
-        return result
+def _csv_bytes(headers: list[str], rows: list[Mapping[str, Any]]) -> bytes:
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=headers)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({h: row.get(h, "") for h in headers})
+    return output.getvalue().encode("utf-8")
 
 
-class AnalyticsStep(Protocol):
-    name: str
-
-    def run(self, context: AnalyticsContext) -> Mapping[str, Any]:
-        ...
+def _put_object(bucket: str, key: str, body: bytes, content_type: str) -> None:
+    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType=content_type)
 
 
-class ProfilingStep:
-    name = "profiling"
-
-    def run(self, context: AnalyticsContext) -> Mapping[str, Any]:
-        dataset = context.dataset
-        return context.record(
-            self.name,
-            {
-                "rows": dataset.rows,
-                "columns": dataset.columns,
-                "source": context.source_key,
-            },
-        )
-
-
-class StatisticsStep:
-    name = "statistics"
-
-    def run(self, context: AnalyticsContext) -> Mapping[str, Any]:
-        dataset = context.dataset
-        return context.record(
-            self.name,
-            {
-                "null_counts": dataset.null_counts,
-            },
-        )
+def _persist_artifact(bucket: str, key: str, spec: Mapping[str, Any]) -> None:
+    kind = spec.get("kind")
+    content_type = spec.get("contentType", "application/octet-stream")
+    if kind == "json":
+        body = _json_bytes(spec.get("data"))
+    elif kind == "text":
+        text = spec.get("text", "")
+        body = text.encode("utf-8")
+    elif kind == "csv":
+        headers = spec.get("headers", [])
+        rows = spec.get("rows", [])
+        body = _csv_bytes(list(headers), list(rows))
+    else:
+        raise ValueError(f"Unsupported artifact kind: {kind}")
+    _put_object(bucket, key, body, content_type)
 
 
-class VisualizationStep:
-    name = "visualizations"
-
-    def run(self, context: AnalyticsContext) -> Mapping[str, Any]:
-        return context.record(
-            self.name,
-            {
-                "artifacts": [],
-                "status": "pending",
-                "message": "Visualization rendering not yet implemented.",
-            },
-        )
-
-
-class MLInferenceStep:
-    name = "ml_inference"
-
-    def run(self, context: AnalyticsContext) -> Mapping[str, Any]:
-        return context.record(
-            self.name,
-            {
-                "models": [],
-                "status": "pending",
-                "message": "ML inference pipeline not yet implemented.",
-            },
-        )
+def _summarize_phase_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    summary: Dict[str, Any] = {}
+    if "summary" in payload and isinstance(payload["summary"], str):
+        summary["summary"] = payload["summary"]
+    if "metrics" in payload and isinstance(payload["metrics"], Mapping):
+        summary["metrics"] = payload["metrics"]
+    if "datasetCompleteness" in payload:
+        summary["datasetCompleteness"] = payload["datasetCompleteness"]
+    if not summary:
+        keys = list(payload.keys())[:5]
+        summary["fields"] = keys
+    return summary
 
 
-class AnalyticsWorkflow:
-    """Coordinator that executes analytics steps sequentially."""
-
-    def __init__(self, steps: List[AnalyticsStep]):
-        self.steps = steps
-
-    def run(self, context: AnalyticsContext) -> Dict[str, Dict[str, Any]]:
-        for step in self.steps:
-            try:
-                step.run(context)
-            except Exception as exc:  # pragma: no cover - defensive logging
-                context.record(
-                    step.name,
-                    {
-                        "error": f"{type(exc).__name__}: {exc}",
-                    },
-                )
-                raise
-        return context.results
-
-
-def _compute_descriptor_from_csv(body: bytes) -> DatasetDescriptor:
-    import csv
-    import io
-
-    text = body.decode("utf-8", errors="replace")
-    reader = csv.DictReader(io.StringIO(text))
-    cols = reader.fieldnames or []
-    rows = 0
-    nulls = {c: 0 for c in cols}
-    for row in reader:
-        rows += 1
-        for c in cols:
-            if row.get(c) in _NULL_SENTINELS:
-                nulls[c] += 1
-    return DatasetDescriptor(rows=rows, columns=cols, null_counts=nulls)
-
-
-def _compute_descriptor_from_json(body: bytes) -> DatasetDescriptor:
-    data = json.loads(body)
-    records = data if isinstance(data, list) else [data]
-    cols = sorted({k for r in records if isinstance(r, dict) for k in r.keys()})
-    return DatasetDescriptor(rows=len(records), columns=cols, null_counts={})
-
-
-def _compute_descriptor_from_jsonl(body: bytes) -> DatasetDescriptor:
-    text = body.decode("utf-8", errors="replace")
-    cols_set = set()
-    rows = 0
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+def _default_callback(job_id: str):
+    def _callback(phase: str, payload: Mapping[str, Any], index: int, total: int) -> None:
+        progress = int(((index + 1) / total) * 100)
         try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        rows += 1
-        if isinstance(obj, dict):
-            cols_set.update(obj.keys())
-    return DatasetDescriptor(rows=rows, columns=sorted(cols_set), null_counts={})
+            ddb_upsert_status(
+                job_id,
+                STATUS_RUNNING,
+                currentPhase=phase,
+                phaseIndex=index,
+                phaseCount=total,
+                progress=progress,
+                phaseSummary=_summarize_phase_payload(payload),
+            )
+        except Exception as exc:  # pragma: no cover - DynamoDB errors shouldn't halt job
+            print(f"[ProcessorFn] Warning: failed to stream phase status for {phase}: {exc}")
+
+    return _callback
 
 
-def compute_dataset_descriptor(key: str, body: bytes) -> DatasetDescriptor:
-    k = key.lower()
-    if k.endswith(".csv"):
-        return _compute_descriptor_from_csv(body)
-    if k.endswith(".jsonl") or k.endswith(".ndjson"):
-        return _compute_descriptor_from_jsonl(body)
-    if k.endswith(".json"):
-        return _compute_descriptor_from_json(body)
-    return DatasetDescriptor(rows=None, columns=[], null_counts={})
+def _persist_pipeline_outputs(job_id: str, bucket: str, result: PipelineResult) -> Dict[str, str]:
+    phase_keys: Dict[str, str] = {}
+    for phase, payload in result.phases.items():
+        key = phase_key_for(job_id, phase)
+        _put_object(bucket, key, _json_bytes(payload), "application/json")
+        phase_keys[phase] = key
+
+    for relative, spec in result.artifact_contents.items():
+        key = artifact_key_for(job_id, relative)
+        _persist_artifact(bucket, key, spec)
+
+    manifest_key = manifest_key_for(job_id)
+    _put_object(bucket, manifest_key, _json_bytes(result.manifest), "application/json")
+
+    return {"manifest": manifest_key, **{f"phase:{k}": v for k, v in phase_keys.items()}}
 
 
-def run_workflow(job_id: str, key: str, body: bytes) -> Dict[str, Any]:
-    descriptor = compute_dataset_descriptor(key, body)
-    context = AnalyticsContext(job_id=job_id, source_key=key, dataset=descriptor)
-    workflow = AnalyticsWorkflow(
-        [
-            ProfilingStep(),
-            StatisticsStep(),
-            VisualizationStep(),
-            MLInferenceStep(),
-        ]
-    )
-    phases = workflow.run(context)
-
-    metrics: Dict[str, Any] = {}
-    profiling = phases.get("profiling", {})
-    statistics = phases.get("statistics", {})
-    if profiling:
-        metrics.update({k: profiling.get(k) for k in ("rows", "columns")})
-    if statistics:
-        metrics["null_counts"] = statistics.get("null_counts", {})
-
+def build_results_payload(job_id: str, result: PipelineResult) -> Dict[str, Any]:
     return {
         "jobId": job_id,
         "analysisVersion": ANALYSIS_VERSION,
-        "phases": phases,
-        "metrics": metrics,
+        "phases": result.phases,
+        "metrics": result.metrics,
+        "correlations": result.correlations,
+        "outliers": result.outliers,
+        "mlInference": result.ml_inference,
+        "artifactManifest": result.manifest,
+        "phaseArtifactKeys": {phase: phase_key_for(job_id, phase) for phase in result.phases},
     }
 
 
@@ -266,18 +186,19 @@ def main(event, _ctx):
     print(f"[ProcessorFn] Processing job {job_id} using s3://{bucket}/{key}")
 
     try:
-        ddb_upsert_status(job_id, STATUS_RUNNING, inputKey=key)
+        ddb_upsert_status(job_id, STATUS_RUNNING, inputKey=key, currentPhase=PHASE_ORDER[0], progress=0)
     except Exception as e:
-        print(f"[ProcessorFn] Warning: failed to upsert RUNNING status: {e}")
+        print(f"[ProcessorFn] Warning: failed to upsert initial RUNNING status: {e}")
 
-    rkey = result_key_for(job_id)
+    artifact_prefix = f"artifacts/{job_id}"
+    results_key = result_key_for(job_id)
 
     try:
-        if ARTIFACTS_BUCKET and object_exists(ARTIFACTS_BUCKET, rkey):
+        if ARTIFACTS_BUCKET and object_exists(ARTIFACTS_BUCKET, results_key):
             print(
-                f"[ProcessorFn] Results already exist at s3://{ARTIFACTS_BUCKET}/{rkey} (idempotent skip)."
+                f"[ProcessorFn] Results already exist at s3://{ARTIFACTS_BUCKET}/{results_key} (idempotent skip)."
             )
-            return {"ok": True, "jobId": job_id, "resultKey": rkey, "idempotent": True}
+            return {"ok": True, "jobId": job_id, "resultKey": results_key, "idempotent": True}
     except Exception as e:
         print(f"[ProcessorFn] Warning: head_object failed for existing results check: {e}")
 
@@ -285,23 +206,33 @@ def main(event, _ctx):
         obj = s3.get_object(Bucket=bucket, Key=key)
         body = obj["Body"].read()
 
-        results = run_workflow(job_id, key, body)
-
-        target_bucket = ARTIFACTS_BUCKET or bucket
-        s3.put_object(
-            Bucket=target_bucket,
-            Key=rkey,
-            Body=json.dumps(results, indent=2).encode(),
-            ContentType="application/json",
+        result = run_pipeline(
+            job_id,
+            {"bucket": bucket, "key": key},
+            body,
+            artifact_prefix=artifact_prefix,
+            on_phase=_default_callback(job_id),
         )
 
+        target_bucket = ARTIFACTS_BUCKET or bucket
+        artifact_keys = _persist_pipeline_outputs(job_id, target_bucket, result)
+
+        results_payload = build_results_payload(job_id, result)
+        _put_object(target_bucket, results_key, _json_bytes(results_payload), "application/json")
+
         try:
-            ddb_upsert_status(job_id, STATUS_SUCCEEDED, resultKey=rkey)
+            ddb_upsert_status(
+                job_id,
+                STATUS_SUCCEEDED,
+                resultKey=results_key,
+                manifestKey=artifact_keys.get("manifest"),
+                completedAt=now_epoch(),
+            )
         except Exception as e:
             print(f"[ProcessorFn] Warning: failed to upsert SUCCEEDED status: {e}")
 
-        print(f"[ProcessorFn] Wrote results to s3://{target_bucket}/{rkey}")
-        return {"ok": True, "jobId": job_id, "resultKey": rkey}
+        print(f"[ProcessorFn] Wrote results to s3://{target_bucket}/{results_key}")
+        return {"ok": True, "jobId": job_id, "resultKey": results_key, "manifestKey": artifact_keys.get("manifest")}
 
     except Exception as e:
         err_txt = f"{type(e).__name__}: {e}"
@@ -314,11 +245,12 @@ def main(event, _ctx):
 
         try:
             target_bucket = ARTIFACTS_BUCKET or bucket
-            s3.put_object(
-                Bucket=target_bucket,
-                Key=rkey.replace("results.json", "error.json"),
-                Body=json.dumps({"jobId": job_id, "error": err_txt}, indent=2).encode(),
-                ContentType="application/json",
+            error_key = results_key.replace("results.json", "error.json")
+            _put_object(
+                target_bucket,
+                error_key,
+                _json_bytes({"jobId": job_id, "error": err_txt}),
+                "application/json",
             )
         except Exception as e3:
             print(f"[ProcessorFn] Warning: failed to write error artifact: {e3}")
