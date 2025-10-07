@@ -6,13 +6,20 @@ only need to plug them into the dispatcher below – the rest of the orchestrati
 remains unchanged.
 """
 
+import csv
+import io
+import json
 import os
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import boto3
 from botocore.exceptions import ClientError
+import requests
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
 s3 = boto3.client("s3")
 ddb = boto3.resource("dynamodb")
@@ -77,7 +84,111 @@ class StagedArtifact:
         return f"s3://{self.bucket}/{self.key}"
 
 
-def _parse_source(item: Dict[str, Dict]) -> Tuple[SourceRef, str]:
+def _safe_filename(name: Optional[str], fallback: str) -> str:
+    candidate = (name or fallback).strip() or fallback
+    candidate = os.path.basename(candidate)
+    candidate = candidate.replace("..", "_")
+    return candidate or fallback
+
+
+def _filename_from_headers(response, url: str) -> str:
+    disposition = response.headers.get("Content-Disposition")
+    if disposition:
+        parts = disposition.split(";")
+        for part in parts[1:]:
+            if "=" not in part:
+                continue
+            key, value = [segment.strip() for segment in part.split("=", 1)]
+            if key.lower() == "filename":
+                return _safe_filename(value.strip('"'), "http-download")
+
+    parsed = urlparse(url)
+    return _safe_filename(os.path.basename(parsed.path), "http-download")
+
+
+def _download_http_source(job_id: str, source: Dict[str, object]) -> SourceRef:
+    url = source.get("url")
+    if not isinstance(url, str):
+        raise ValueError("HTTP source missing url")
+
+    method = str(source.get("method") or "GET").upper()
+    headers = source.get("headers") or {}
+    if not isinstance(headers, dict):
+        raise ValueError("HTTP headers must be a mapping")
+    body = source.get("body")
+    timeout = source.get("timeout") or 30
+
+    response = requests.request(method, url, headers=headers, data=body, timeout=timeout)
+    if response.status_code >= 400:
+        raise ValueError(f"HTTP connector received status {response.status_code} from {url}")
+
+    filename = _safe_filename(source.get("filename"), _filename_from_headers(response, url))
+    key = f"artifacts/{job_id}/input/{filename}"
+
+    s3.put_object(
+        Bucket=ARTIFACTS_BUCKET,
+        Key=key,
+        Body=response.content,
+        ContentType=response.headers.get("Content-Type"),
+    )
+
+    return SourceRef(ARTIFACTS_BUCKET, key)
+
+
+def _json_default(value):
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="ignore")
+    return str(value)
+
+
+def _extract_sql_source(job_id: str, source: Dict[str, object], *, default_name: str) -> SourceRef:
+    url = source.get("url")
+    query = source.get("query")
+    if not isinstance(url, str) or not isinstance(query, str):
+        raise ValueError("SQL source requires url and query")
+
+    params = source.get("params") or {}
+    if params and not isinstance(params, dict):
+        raise ValueError("SQL params must be a mapping")
+
+    filename = _safe_filename(source.get("filename"), default_name)
+    export_format = str(source.get("format") or "csv").lower()
+    if export_format not in {"csv", "jsonl"}:
+        raise ValueError("SQL export format must be 'csv' or 'jsonl'")
+
+    engine = create_engine(url)
+    try:
+        with engine.connect() as connection:
+            result = connection.execute(text(query), params)
+
+            if export_format == "csv":
+                buffer = io.StringIO()
+                writer = csv.writer(buffer)
+                writer.writerow(result.keys())
+                for row in result:
+                    writer.writerow([str(value) if value is not None else "" for value in row])
+                payload = buffer.getvalue().encode("utf-8")
+                content_type = "text/csv"
+            else:
+                lines = []
+                for mapping in result.mappings():
+                    lines.append(json.dumps(dict(mapping), default=_json_default))
+                payload = "\n".join(lines).encode("utf-8")
+                content_type = "application/json"
+    except NoSuchModuleError as exc:
+        raise ValueError("SQL driver for the provided URL is not installed") from exc
+    except DBAPIError as exc:
+        raise ValueError(f"Failed to execute SQL query: {exc}") from exc
+    finally:
+        engine.dispose()
+
+    key = f"artifacts/{job_id}/input/{filename}"
+    s3.put_object(Bucket=ARTIFACTS_BUCKET, Key=key, Body=payload, ContentType=content_type)
+
+    return SourceRef(ARTIFACTS_BUCKET, key)
+
+
+def _resolve_source(job_id: str, item: Dict[str, Dict]) -> Tuple[SourceRef, str]:
     source = item.get("source") or {}
     source_type = source.get("type")
 
@@ -97,6 +208,19 @@ def _parse_source(item: Dict[str, Dict]) -> Tuple[SourceRef, str]:
         if len(parts) != 2 or not parts[0] or not parts[1]:
             raise ValueError("Invalid S3 URI")
         return SourceRef(parts[0], parts[1]), source_type
+
+    if source_type == "http":
+        protocol = source.get("protocol") or "http"
+        return _download_http_source(job_id, source), protocol
+
+    if source_type == "database":
+        ref = _extract_sql_source(job_id, source, default_name="database-export.csv")
+        return ref, source_type
+
+    if source_type == "warehouse":
+        warehouse_type = source.get("warehouseType") or "warehouse"
+        ref = _extract_sql_source(job_id, source, default_name=f"{warehouse_type}-export.csv")
+        return ref, f"warehouse:{warehouse_type}"
 
     raise ValueError(f"Unsupported source type: {source_type}")
 
@@ -201,7 +325,7 @@ def handler(event, _context):
     if not item:
         raise ValueError(f"Job {job_id} not found")
 
-    src, source_type = _parse_source(item)
+    src, source_type = _resolve_source(job_id, item)
 
     # Mark job as staging (idempotent)
     _ddb_update(job_id, STATUS_STAGING)

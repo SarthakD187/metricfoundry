@@ -39,8 +39,108 @@ app = FastAPI(title="MetricFoundry API")
 
 # ---- Models ----
 class CreateJob(BaseModel):
-    source_type: str            # "upload" | "s3"
-    s3_path: str | None = None  # required if source_type == "s3"
+    """Request payload for job creation.
+
+    ``source_type`` determines which connector will be used.  Historically the
+    API only accepted ``upload`` and ``s3`` jobs – we now expose a ``source_config``
+    payload so that richer connectors (HTTP endpoints, databases, data
+    warehouses, etc.) can pass the metadata they need without changing the core
+    contract for existing clients.
+    """
+
+    source_type: str
+    s3_path: str | None = None
+    source_config: Dict[str, object] | None = None
+
+
+def _clean_config(config: Dict[str, object] | None) -> Dict[str, object]:
+    return {key: value for key, value in (config or {}).items() if value is not None}
+
+
+def _build_source(body: CreateJob, job_id: str) -> tuple[dict, Optional[str]]:
+    """Normalise the user's request into an internal ``source`` descriptor.
+
+    Returns a tuple of ``(source_metadata, upload_url)`` where the latter is only
+    populated for ``upload`` workflows that expect the client to PUT data
+    directly to S3.
+    """
+
+    source_type = body.source_type
+    config = _clean_config(body.source_config)
+
+    if source_type == "upload":
+        key = f"artifacts/{job_id}/input/upload.csv"
+        upload_url = s3.generate_presigned_url(
+            ClientMethod="put_object",
+            Params={"Bucket": BUCKET_NAME, "Key": key, "ContentType": "text/csv"},
+            ExpiresIn=900,
+        )
+        source = {"type": "upload", "bucket": BUCKET_NAME, "key": key}
+        return source, upload_url
+
+    if source_type == "s3":
+        path = body.s3_path or config.get("uri") or config.get("path")
+        if not path or not path.startswith("s3://"):
+            raise HTTPException(status_code=400, detail="s3_path must be like s3://bucket/key")
+        return {"type": "s3", "uri": path}, None
+
+    if source_type in {"http", "https"}:
+        url = config.get("url") or body.s3_path
+        if not url or not url.startswith("http"):
+            raise HTTPException(status_code=400, detail="source_config.url is required for http jobs")
+        method = (config.get("method") or "GET").upper()
+        if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            raise HTTPException(status_code=400, detail="Unsupported HTTP method")
+        headers = config.get("headers") or {}
+        if not isinstance(headers, dict):
+            raise HTTPException(status_code=400, detail="headers must be a JSON object")
+        source = {
+            "type": "http",
+            "protocol": source_type,
+            "url": url,
+            "method": method,
+            "headers": headers,
+            "body": config.get("body"),
+            "filename": config.get("filename"),
+            "timeout": config.get("timeout"),
+        }
+        return _clean_config(source), None
+
+    if source_type == "database":
+        url = config.get("url")
+        query = config.get("query")
+        if not url or not query:
+            raise HTTPException(status_code=400, detail="database jobs require url and query in source_config")
+        source = {
+            "type": "database",
+            "url": url,
+            "query": query,
+            "params": config.get("params"),
+            "filename": config.get("filename"),
+            "format": config.get("format", "csv"),
+        }
+        return _clean_config(source), None
+
+    if source_type == "warehouse":
+        warehouse_type = (config.get("warehouseType") or config.get("type") or "").lower()
+        if warehouse_type not in {"redshift", "snowflake", "bigquery", "databricks"}:
+            raise HTTPException(status_code=400, detail="warehouseType must be redshift, snowflake, bigquery, or databricks")
+        url = config.get("url")
+        query = config.get("query")
+        if not url or not query:
+            raise HTTPException(status_code=400, detail="warehouse jobs require url and query in source_config")
+        source = {
+            "type": "warehouse",
+            "warehouseType": warehouse_type,
+            "url": url,
+            "query": query,
+            "params": config.get("params"),
+            "filename": config.get("filename"),
+            "format": config.get("format", "csv"),
+        }
+        return _clean_config(source), None
+
+    raise HTTPException(status_code=400, detail="Unsupported source_type")
 
 # ---- Helpers ----
 def record_metric(name: str, value: float = 1, unit: str = "Count", dimensions: Optional[Dict[str, str]] | None = None) -> None:
@@ -153,29 +253,20 @@ def health():
 
 @app.post("/jobs")
 def create_job(body: CreateJob):
-    if body.source_type not in ("upload", "s3"):
-        record_metric("JobValidationError", dimensions={"SourceType": str(body.source_type)})
-        raise HTTPException(status_code=400, detail="source_type must be 'upload' or 's3'")
-
     job_id = str(uuid.uuid4())
     now = epoch()
     dimensions = {"SourceType": body.source_type}
-    logger.info("creating job", extra={"job_id": job_id, **dimensions})
 
-    if body.source_type == "upload":
-        key = f"artifacts/{job_id}/input/upload.csv"
-        upload_url = s3.generate_presigned_url(
-            ClientMethod="put_object",
-            Params={"Bucket": BUCKET_NAME, "Key": key, "ContentType": "text/csv"},
-            ExpiresIn=900,
-        )
-        source = {"type": "upload", "bucket": BUCKET_NAME, "key": key}
-    else:
-        if not body.s3_path or not body.s3_path.startswith("s3://"):
-            record_metric("JobValidationError", dimensions=dimensions)
-            raise HTTPException(status_code=400, detail="s3_path must be like s3://bucket/key")
-        upload_url = None
-        source = {"type": "s3", "uri": body.s3_path}
+    try:
+        source, upload_url = _build_source(body, job_id)
+    except HTTPException:
+        record_metric("JobValidationError", dimensions=dimensions)
+        raise
+    except Exception as exc:  # pragma: no cover - defensive guard
+        record_metric("JobValidationError", dimensions=dimensions)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    logger.info("creating job", extra={"job_id": job_id, **dimensions})
 
     try:
         ddb_put_job(job_id, status="CREATED", source=source, created=now)

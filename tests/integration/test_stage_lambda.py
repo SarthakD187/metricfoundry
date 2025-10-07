@@ -1,6 +1,7 @@
 import importlib
 import io
 import hashlib
+import sqlite3
 from datetime import datetime, timezone
 from typing import Dict
 
@@ -111,6 +112,14 @@ def stage_lambda(monkeypatch):
     monkeypatch.setenv("JOBS_TABLE", "jobs-table")
     monkeypatch.setenv("ARTIFACTS_BUCKET", "artifacts-bucket")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
     module = importlib.import_module("lambdas.stage.handler")
     importlib.reload(module)
@@ -186,3 +195,105 @@ def test_stage_lambda_end_to_end(stage_lambda, job_source, bucket, key, body, co
     metadata = result["metadata"]
     assert metadata["format"] == expected_format
     assert result["input"]["key"] == expected_key
+
+
+def test_stage_lambda_http_connector(stage_lambda, monkeypatch):
+    module, fake_s3, fake_table = stage_lambda
+    job_id = "job-http"
+    payload = b"id,value\n1,99\n"
+
+    class DummyResponse:
+        status_code = 200
+        headers = {"Content-Type": "text/csv", "Content-Disposition": "attachment; filename=data.csv"}
+        content = payload
+
+    def fake_request(method, url, headers=None, data=None, timeout=None):  # noqa: D401 - simple stub
+        assert method == "GET"
+        assert url == "https://example.com/data.csv"
+        return DummyResponse()
+
+    fake_table.put_item(
+        {
+            "pk": f"job#{job_id}",
+            "sk": "meta",
+            "status": "QUEUED",
+            "source": {"type": "http", "protocol": "https", "url": "https://example.com/data.csv"},
+        }
+    )
+
+    monkeypatch.setattr(module.requests, "request", fake_request)
+
+    result = module.handler({"jobId": job_id}, None)
+
+    expected_key = f"artifacts/{job_id}/input/data.csv"
+    obj = fake_s3.get_object(Bucket=module.ARTIFACTS_BUCKET, Key=expected_key)
+    assert obj["Body"].read() == payload
+
+    assert result["metadata"]["sourceType"] == "https"
+
+
+def test_stage_lambda_sqlite_connector(stage_lambda, tmp_path):
+    module, fake_s3, fake_table = stage_lambda
+    job_id = "job-sqlite"
+
+    db_path = tmp_path / "example.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE metrics(id INTEGER PRIMARY KEY, value INTEGER)")
+    conn.execute("INSERT INTO metrics(value) VALUES (42)")
+    conn.commit()
+    conn.close()
+
+    fake_table.put_item(
+        {
+            "pk": f"job#{job_id}",
+            "sk": "meta",
+            "status": "QUEUED",
+            "source": {
+                "type": "database",
+                "url": f"sqlite:///{db_path}",
+                "query": "SELECT id, value FROM metrics",
+                "filename": "metrics.csv",
+            },
+        }
+    )
+
+    result = module.handler({"jobId": job_id}, None)
+
+    expected_key = f"artifacts/{job_id}/input/metrics.csv"
+    obj = fake_s3.get_object(Bucket=module.ARTIFACTS_BUCKET, Key=expected_key)
+    body = obj["Body"].read().decode("utf-8")
+    assert "id,value" in body
+    assert "42" in body
+
+    assert result["metadata"]["sourceType"] == "database"
+
+
+def test_stage_lambda_warehouse_metadata(stage_lambda, tmp_path):
+    module, fake_s3, fake_table = stage_lambda
+    job_id = "job-warehouse"
+
+    db_path = tmp_path / "warehouse.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE warehouse_data(id INTEGER PRIMARY KEY, amount INTEGER)")
+    conn.execute("INSERT INTO warehouse_data(amount) VALUES (7)")
+    conn.commit()
+    conn.close()
+
+    fake_table.put_item(
+        {
+            "pk": f"job#{job_id}",
+            "sk": "meta",
+            "status": "QUEUED",
+            "source": {
+                "type": "warehouse",
+                "warehouseType": "snowflake",
+                "url": f"sqlite:///{db_path}",
+                "query": "SELECT amount FROM warehouse_data",
+            },
+        }
+    )
+
+    module.handler({"jobId": job_id}, None)
+
+    record = fake_table.get_item({"pk": f"job#{job_id}", "sk": "meta"}).get("Item")
+    assert record["inputMetadata"]["sourceType"] == "warehouse:snowflake"

@@ -39,8 +39,78 @@ def test_create_job_validation_error(api_app):
     client = api_app["client"]
     response = client.post("/jobs", json={"source_type": "invalid"})
     assert response.status_code == 400
+    assert response.json()["detail"] == "Unsupported source_type"
     names = metric_names(api_app["cloudwatch"].metric_calls)
     assert "JobValidationError" in names
+
+
+def test_create_http_job(api_app):
+    client = api_app["client"]
+    module = api_app["module"]
+    payload = {
+        "source_type": "https",
+        "source_config": {"url": "https://example.com/data.csv", "headers": {"Authorization": "Bearer token"}},
+    }
+    response = client.post("/jobs", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body.get("uploadUrl") is None
+
+    job_id = body["jobId"]
+    record = module.table.get_item({"pk": f"job#{job_id}", "sk": "meta"}).get("Item")
+    assert record is not None
+    assert record["source"]["type"] == "http"
+    assert record["source"]["protocol"] == "https"
+    assert record["source"]["url"] == "https://example.com/data.csv"
+
+
+def test_create_database_job_requires_config(api_app):
+    client = api_app["client"]
+    response = client.post("/jobs", json={"source_type": "database"})
+    assert response.status_code == 400
+    assert "database jobs require url and query" in response.json()["detail"]
+
+    response = client.post(
+        "/jobs",
+        json={
+            "source_type": "database",
+            "source_config": {"url": "sqlite:///tmp/example.db", "query": "SELECT 1", "format": "jsonl"},
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["jobId"]
+    record = api_app["module"].table.get_item({"pk": f"job#{job_id}", "sk": "meta"}).get("Item")
+    assert record["source"]["format"] == "jsonl"
+
+
+def test_create_warehouse_job_validation(api_app):
+    client = api_app["client"]
+    response = client.post(
+        "/jobs",
+        json={
+            "source_type": "warehouse",
+            "source_config": {"url": "sqlite:///tmp/example.db", "query": "SELECT 1"},
+        },
+    )
+    assert response.status_code == 400
+    assert "warehouseType" in response.json()["detail"]
+
+    response = client.post(
+        "/jobs",
+        json={
+            "source_type": "warehouse",
+            "source_config": {
+                "warehouseType": "snowflake",
+                "url": "sqlite:///tmp/example.db",
+                "query": "SELECT 1",
+                "filename": "warehouse-output.csv",
+            },
+        },
+    )
+    assert response.status_code == 200
+    record = api_app["module"].table.get_item({"pk": f"job#{response.json()['jobId']}", "sk": "meta"}).get("Item")
+    assert record["source"]["warehouseType"] == "snowflake"
+    assert record["source"]["filename"] == "warehouse-output.csv"
 
 
 @pytest.mark.parametrize("path,expected_status", [(None, 200), ("data.csv", 200), ("missing.csv", 404)])
