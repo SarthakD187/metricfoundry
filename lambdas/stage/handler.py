@@ -6,6 +6,7 @@ only need to plug them into the dispatcher below – the rest of the orchestrati
 remains unchanged.
 """
 
+import base64
 import csv
 import io
 import json
@@ -23,6 +24,8 @@ from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
 s3 = boto3.client("s3")
 ddb = boto3.resource("dynamodb")
+secretsmanager = boto3.client("secretsmanager")
+ssm = boto3.client("ssm")
 
 TABLE_NAME = os.environ["JOBS_TABLE"]
 ARTIFACTS_BUCKET = os.environ["ARTIFACTS_BUCKET"]
@@ -141,11 +144,70 @@ def _json_default(value):
     return str(value)
 
 
-def _extract_sql_source(job_id: str, source: Dict[str, object], *, default_name: str) -> SourceRef:
+def _secret_payload_value(raw_value: str, *, field: Optional[str]) -> str:
+    if field:
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError as exc:  # pragma: no cover - validated via calling code
+            raise ValueError("Secret payload must be JSON when secretField is provided") from exc
+        if field not in parsed:
+            raise ValueError(f"Secret payload missing field '{field}'")
+        value = parsed[field]
+    else:
+        value = raw_value
+
+    if not isinstance(value, str):
+        raise ValueError("Database connection secret must resolve to a string")
+
+    value = value.strip()
+    if not value:
+        raise ValueError("Database connection string cannot be empty")
+
+    return value
+
+
+def _resolve_sql_connection(source: Dict[str, object]) -> str:
     url = source.get("url")
+    if isinstance(url, str) and url.strip():
+        return url.strip()
+
+    secret_arn = source.get("secretArn")
+    parameter_name = source.get("parameterName")
+    secret_field = source.get("secretField")
+
+    if secret_arn:
+        try:
+            response = secretsmanager.get_secret_value(SecretId=secret_arn)
+        except ClientError as exc:
+            raise ValueError(f"Failed to retrieve secret {secret_arn}: {exc}") from exc
+        if "SecretString" in response and response["SecretString"] is not None:
+            raw_value = response["SecretString"]
+        elif "SecretBinary" in response and response["SecretBinary"] is not None:
+            raw_value = base64.b64decode(response["SecretBinary"]).decode("utf-8")
+        else:
+            raise ValueError(f"Secret {secret_arn} does not contain a value")
+        return _secret_payload_value(raw_value, field=secret_field)
+
+    if parameter_name:
+        try:
+            response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+        except ClientError as exc:
+            raise ValueError(f"Failed to retrieve parameter {parameter_name}: {exc}") from exc
+        parameter = response.get("Parameter") or {}
+        raw_value = parameter.get("Value")
+        if raw_value is None:
+            raise ValueError(f"Parameter {parameter_name} does not contain a value")
+        return _secret_payload_value(raw_value, field=secret_field)
+
+    raise ValueError("SQL source requires a connection string via url, secretArn, or parameterName")
+
+
+def _extract_sql_source(job_id: str, source: Dict[str, object], *, default_name: str) -> SourceRef:
     query = source.get("query")
-    if not isinstance(url, str) or not isinstance(query, str):
-        raise ValueError("SQL source requires url and query")
+    if not isinstance(query, str):
+        raise ValueError("SQL source requires a query")
+
+    url = _resolve_sql_connection(source)
 
     params = source.get("params") or {}
     if params and not isinstance(params, dict):
