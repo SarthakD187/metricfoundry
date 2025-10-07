@@ -90,11 +90,28 @@ It supports:
 
 ### Running locally
 
+The Next.js source lives directly under [`dashboard/`](dashboard/). If you do not
+see that directory after cloning the repository, double-check that you are on an
+up-to-date branch (`git pull origin main`) and that your checkout completed
+successfully. A missing folder indicates your local copy predates the dashboard
+being added.
+
+Once the directory is present you can work from inside it:
+
 ```bash
 cd dashboard
 npm install
 # Point the UI at your running API (defaults to http://localhost:8000)
 NEXT_PUBLIC_API_BASE_URL="https://your-api.example.com" npm run dev
+```
+
+Alternatively, stay at the repository root and use the helper scripts that proxy
+into the dashboard workspace:
+
+```bash
+npm run dashboard:install
+# Point the UI at your running API (defaults to http://localhost:8000)
+NEXT_PUBLIC_API_BASE_URL="https://your-api.example.com" npm run dashboard:dev
 ```
 
 The dashboard persists recently viewed job IDs in local storage so you can revisit
