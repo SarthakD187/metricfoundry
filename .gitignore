@@ -7,3 +7,7 @@ __pycache__/
 cdk.out/
 dist/
 .env
+# dashboard build artifacts
+dashboard/node_modules
+dashboard/.next
+dashboard/out
