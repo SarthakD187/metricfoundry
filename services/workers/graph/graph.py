@@ -3,9 +3,15 @@ from __future__ import annotations
 
 import base64
 import csv
+import gzip
 import io
 import json
 import math
+import os
+import sqlite3
+import tarfile
+import tempfile
+import zipfile
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
@@ -252,13 +258,21 @@ def _format_preview(value: Any) -> Any:
     return text
 
 
-def _ingest_csv(key: str, body: bytes) -> DatasetSummary:
+def _ingest_delimited(key: str, body: bytes, delimiter: str, source_format: str) -> DatasetSummary:
     text = body.decode("utf-8", errors="replace")
-    reader = csv.DictReader(io.StringIO(text))
-    builder = _DatasetBuilder(bytes_read=len(body), source_format="csv")
+    reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+    builder = _DatasetBuilder(bytes_read=len(body), source_format=source_format)
     for row in reader:
         builder.process_row(row)
     return builder.build()
+
+
+def _ingest_csv(key: str, body: bytes) -> DatasetSummary:
+    return _ingest_delimited(key, body, ",", "csv")
+
+
+def _ingest_tsv(key: str, body: bytes) -> DatasetSummary:
+    return _ingest_delimited(key, body, "\t", "tsv")
 
 
 def _ingest_json(body: bytes) -> DatasetSummary:
@@ -292,8 +306,209 @@ def _ingest_jsonl(body: bytes) -> DatasetSummary:
     return builder.build()
 
 
+def _dataframe_to_dataset(frame: Any, source_format: str, bytes_read: int) -> DatasetSummary:
+    try:
+        import pandas as pd  # type: ignore
+    except ImportError as exc:  # pragma: no cover - dependency issues are surfaced at runtime
+        raise RuntimeError(
+            f"{source_format} ingestion requires the pandas dependency"
+        ) from exc
+
+    if not hasattr(frame, "to_dict"):
+        frame = pd.DataFrame(frame)
+
+    sanitized = frame.copy()
+    sanitized.columns = [str(col) for col in sanitized.columns]
+    sanitized = sanitized.where(pd.notnull(sanitized), None)
+
+    builder = _DatasetBuilder(bytes_read=bytes_read, source_format=source_format)
+    for record in sanitized.to_dict(orient="records"):
+        builder.process_row(record)
+    return builder.build()
+
+
+def _ingest_excel(body: bytes) -> DatasetSummary:
+    try:
+        import pandas as pd  # type: ignore
+    except ImportError as exc:  # pragma: no cover - dependency issues are surfaced at runtime
+        raise RuntimeError("Excel ingestion requires pandas with openpyxl installed") from exc
+
+    with io.BytesIO(body) as stream:
+        frames = pd.read_excel(stream, sheet_name=None, dtype=object)
+
+    if isinstance(frames, dict):
+        collected = []
+        for sheet_name, frame in frames.items():
+            if frame is None or frame.empty:
+                continue
+            sheet_frame = frame.copy()
+            sheet_frame.insert(0, "__sheet__", str(sheet_name))
+            collected.append(sheet_frame)
+        if collected:
+            combined = pd.concat(collected, ignore_index=True)
+        else:
+            combined = pd.DataFrame()
+        target = combined
+    else:
+        target = frames
+
+    return _dataframe_to_dataset(target, "excel", len(body))
+
+
+def _ingest_parquet(body: bytes) -> DatasetSummary:
+    try:
+        import pandas as pd  # type: ignore
+    except ImportError as exc:  # pragma: no cover - dependency issues are surfaced at runtime
+        raise RuntimeError("Parquet ingestion requires pandas with pyarrow installed") from exc
+
+    with io.BytesIO(body) as stream:
+        frame = pd.read_parquet(stream)
+
+    return _dataframe_to_dataset(frame, "parquet", len(body))
+
+
+def _normalize_database_value(value: Any) -> Any:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return base64.b64encode(bytes(value)).decode("ascii")
+    return value
+
+
+def _ingest_sqlite(body: bytes) -> DatasetSummary:
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite")
+    try:
+        temp.write(body)
+        temp.flush()
+        temp.close()
+
+        conn = sqlite3.connect(temp.name)
+        try:
+            cursor = conn.cursor()
+            tables = [
+                row[0]
+                for row in cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') "
+                    "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                )
+            ]
+
+            builder = _DatasetBuilder(bytes_read=len(body), source_format="sqlite")
+            if not tables:
+                return builder.build()
+
+            multi_table = len(tables) > 1
+            for table in tables:
+                quoted = table.replace("\"", "\"\"")
+                cursor.execute(f'SELECT * FROM "{quoted}"')
+                columns = [desc[0] if desc[0] else f"column_{index}" for index, desc in enumerate(cursor.description or [])]
+                for values in cursor:
+                    record = {
+                        columns[i]: _normalize_database_value(values[i]) for i in range(len(columns))
+                    }
+                    if multi_table:
+                        record["_table"] = table
+                    builder.process_row(record)
+            return builder.build()
+        finally:
+            conn.close()
+    finally:
+        try:
+            os.unlink(temp.name)
+        except FileNotFoundError:  # pragma: no cover - best effort cleanup
+            pass
+
+
+_ZIP_PREFERRED_EXTENSIONS = [
+    ".csv",
+    ".tsv",
+    ".jsonl",
+    ".ndjson",
+    ".json",
+    ".parquet",
+    ".pq",
+    ".pqt",
+    ".parq",
+    ".xlsx",
+    ".xls",
+    ".xlsm",
+    ".sqlite",
+    ".sqlite3",
+    ".db",
+]
+
+
+def _zip_member_priority(name: str) -> Tuple[int, str]:
+    lowered = name.lower()
+    for index, ext in enumerate(_ZIP_PREFERRED_EXTENSIONS):
+        if lowered.endswith(ext):
+            return index, lowered
+    return len(_ZIP_PREFERRED_EXTENSIONS), lowered
+
+
+def _ingest_zip(key: str, body: bytes) -> DatasetSummary:
+    try:
+        with zipfile.ZipFile(io.BytesIO(body)) as archive:
+            members = [info for info in archive.infolist() if not info.is_dir()]
+            members.sort(key=lambda info: _zip_member_priority(info.filename))
+            for info in members:
+                data = archive.read(info.filename)
+                try:
+                    return ingest_dataset(info.filename, data)
+                except ValueError:
+                    continue
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"Invalid ZIP archive: {key}") from exc
+    raise ValueError(f"ZIP archive does not contain a supported dataset: {key}")
+
+
+def _ingest_tar(key: str, body: bytes) -> DatasetSummary:
+    try:
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r:*") as archive:
+            members = [member for member in archive.getmembers() if member.isfile()]
+            members.sort(key=lambda member: _zip_member_priority(member.name))
+            for member in members:
+                handle = archive.extractfile(member)
+                if handle is None:
+                    continue
+                data = handle.read()
+                handle.close()
+                try:
+                    return ingest_dataset(member.name, data)
+                except ValueError:
+                    continue
+    except tarfile.TarError as exc:
+        raise ValueError(f"Invalid TAR archive: {key}") from exc
+    raise ValueError(f"TAR archive does not contain a supported dataset: {key}")
+
+
+def _strip_compression_suffix(name: str) -> str:
+    lowered = name.lower()
+    if lowered.endswith(".gzip"):
+        return name[: -len(".gzip")]
+    if lowered.endswith(".gz"):
+        return name[: -len(".gz")]
+    return name
+
+
 def ingest_dataset(key: str, body: bytes) -> DatasetSummary:
     lowered = key.lower()
+    if lowered.endswith(".zip"):
+        return _ingest_zip(key, body)
+    if lowered.endswith(".tar") or lowered.endswith(".tar.gz") or lowered.endswith(".tgz"):
+        return _ingest_tar(key, body)
+    if lowered.endswith(".gz") or lowered.endswith(".gzip"):
+        try:
+            decompressed = gzip.decompress(body)
+        except OSError as exc:
+            raise ValueError(f"Invalid GZIP payload: {key}") from exc
+        return ingest_dataset(_strip_compression_suffix(key), decompressed)
+    if lowered.endswith(".parquet") or lowered.endswith(".pq") or lowered.endswith(".pqt") or lowered.endswith(".parq"):
+        return _ingest_parquet(body)
+    if lowered.endswith(".xlsx") or lowered.endswith(".xls") or lowered.endswith(".xlsm"):
+        return _ingest_excel(body)
+    if lowered.endswith(".sqlite") or lowered.endswith(".sqlite3") or lowered.endswith(".db"):
+        return _ingest_sqlite(body)
+    if lowered.endswith(".tsv") or lowered.endswith(".tab"):
+        return _ingest_tsv(key, body)
     if lowered.endswith(".jsonl") or lowered.endswith(".ndjson"):
         return _ingest_jsonl(body)
     if lowered.endswith(".json"):
