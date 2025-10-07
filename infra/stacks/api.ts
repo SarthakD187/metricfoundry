@@ -1,50 +1,73 @@
 // infra/stacks/api.ts
-import { Stack, StackProps, Duration, CfnOutput } from "aws-cdk-lib";
+import { Stack, StackProps, Duration } from "aws-cdk-lib";
 import { Construct } from "constructs";
+import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as iam from "aws-cdk-lib/aws-iam";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as integrations from "aws-cdk-lib/aws-apigatewayv2-integrations";
-import * as lambda from "aws-cdk-lib/aws-lambda";
-import * as s3 from "aws-cdk-lib/aws-s3";
-import * as sqs from "aws-cdk-lib/aws-sqs";
-import * as ddb from "aws-cdk-lib/aws-dynamodb";
-import * as path from "path";
 
-export interface ApiStackProps extends StackProps {
-  artifacts: s3.Bucket;
-  jobsQueue: sqs.Queue;
-  jobsTable: ddb.Table;
+interface MetricFoundryApiStackProps extends StackProps {
+  artifactsBucket: any;
+  jobsTable: any;
+  jobsQueue?: any;
 }
 
 export class MetricFoundryApiStack extends Stack {
-  constructor(scope: Construct, id: string, props: ApiStackProps) {
+  constructor(scope: Construct, id: string, props: MetricFoundryApiStackProps) {
     super(scope, id, props);
 
-    const assetPath = path.resolve(__dirname, "../../services/api");
+    const { artifactsBucket, jobsTable, jobsQueue } = props;
 
-    const fn = new lambda.DockerImageFunction(this, "ApiFn", {
-  code: lambda.DockerImageCode.fromImageAsset(assetPath, { file: "Dockerfile" }),
-  memorySize: 512,
-  timeout: Duration.seconds(10),
-  architecture: lambda.Architecture.ARM_64,   // <- add this line
+    // ------------------------------------------------------------------------
+    // API Lambda (FastAPI + Mangum)
+    // ------------------------------------------------------------------------
+    const apiFn = new lambda.Function(this, "ApiFn", {
+  runtime: lambda.Runtime.PYTHON_3_11,   // ⬅️ switch from PYTHON_3_12
+  architecture: lambda.Architecture.ARM_64,
+  handler: "app.handler",
+  code: lambda.Code.fromAsset("services/api"),
+  timeout: Duration.seconds(29),
   environment: {
-    BUCKET_NAME: props.artifacts.bucketName,
-    TABLE_NAME: props.jobsTable.tableName,
-    QUEUE_URL: props.jobsQueue.queueUrl,
+    BUCKET_NAME: artifactsBucket.bucketName,
+    TABLE_NAME: jobsTable.tableName,
+    QUEUE_URL: jobsQueue ? jobsQueue.queueUrl : "",
   },
 });
 
-    // Least-privilege grants
-    props.artifacts.grantPut(fn);                  // allow uploads
-    props.jobsTable.grantWriteData(fn);            // create job rows
-    props.jobsQueue.grantSendMessages(fn);         // enqueue
+    // ------------------------------------------------------------------------
+    // Permissions
+    // ------------------------------------------------------------------------
+    artifactsBucket.grantReadWrite(apiFn);
+    jobsTable.grantReadWriteData(apiFn);
 
-    const http = new apigwv2.HttpApi(this, "HttpApi");
-    http.addRoutes({
-      path: "/{proxy+}",
-      methods: [apigwv2.HttpMethod.ANY],
-      integration: new integrations.HttpLambdaIntegration("ApiIntegration", fn),
+    if (jobsQueue) {
+      apiFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: ["sqs:SendMessage"],
+          resources: [jobsQueue.queueArn],
+        })
+      );
+    }
+
+    // ------------------------------------------------------------------------
+    // HTTP API Gateway
+    // ------------------------------------------------------------------------
+    const httpApi = new apigwv2.HttpApi(this, "HttpApi", {
+      apiName: "MetricFoundryApi",
+      description: "FastAPI backend for MetricFoundry",
+      corsPreflight: {
+        allowOrigins: ["*"],
+        allowMethods: [apigwv2.CorsHttpMethod.ANY],
+      },
     });
 
-    new CfnOutput(this, "HttpApiUrl", { value: http.apiEndpoint });
+    httpApi.addRoutes({
+      path: "/{proxy+}",
+      methods: [apigwv2.HttpMethod.ANY],
+      integration: new integrations.HttpLambdaIntegration("ApiIntegration", apiFn),
+    });
+
+    // Output the API endpoint
+    this.exportValue(httpApi.apiEndpoint, { name: "HttpApiUrl" });
   }
 }
