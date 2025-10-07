@@ -64,8 +64,8 @@ export class MetricFoundryCoreStack extends Stack {
           ],
         },
       }),
-      timeout: Duration.minutes(2),
-      memorySize: 512,
+      timeout: Duration.minutes(10),
+      memorySize: 2048,
       environment: {
         JOBS_TABLE: this.jobsTable.tableName,
         ARTIFACTS_BUCKET: this.artifacts.bucketName,
@@ -104,8 +104,8 @@ export class MetricFoundryCoreStack extends Stack {
       code: lambda.DockerImageCode.fromImageAsset(".", {
         file: "lambdas/processor/Dockerfile",
       }),
-      timeout: Duration.minutes(2),
-      memorySize: 1024,
+      timeout: Duration.minutes(15),
+      memorySize: 4096,
       environment: {
         JOBS_TABLE: this.jobsTable.tableName,
         ARTIFACTS_BUCKET: this.artifacts.bucketName,
