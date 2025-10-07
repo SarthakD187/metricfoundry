@@ -2,7 +2,6 @@
 import { Stack, StackProps, Duration, RemovalPolicy } from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as s3 from "aws-cdk-lib/aws-s3";
-import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as ddb from "aws-cdk-lib/aws-dynamodb";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as iam from "aws-cdk-lib/aws-iam";
@@ -11,7 +10,6 @@ import * as tasks from "aws-cdk-lib/aws-stepfunctions-tasks";
 
 export class MetricFoundryCoreStack extends Stack {
   public readonly artifacts: s3.Bucket;
-  public readonly jobsQueue: sqs.Queue;
   public readonly jobsTable: ddb.Table;
   public readonly jobsStateMachine: sfn.StateMachine;
 
@@ -36,13 +34,6 @@ export class MetricFoundryCoreStack extends Stack {
       ],
       removalPolicy: RemovalPolicy.RETAIN,
       autoDeleteObjects: false,
-    });
-
-    // --- SQS (existing, unused by the worker but kept as-is) ---
-    const dlq = new sqs.Queue(this, "DLQ");
-    this.jobsQueue = new sqs.Queue(this, "JobsQueue", {
-      visibilityTimeout: Duration.seconds(90),
-      deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
     });
 
     // --- Jobs table (pk/sk schema retained) ---

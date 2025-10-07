@@ -10,6 +10,5 @@ const core = new MetricFoundryCoreStack(app, "MetricFoundry-Core");
 new MetricFoundryApiStack(app, "MetricFoundry-Api", {
   artifactsBucket: core.artifacts,
   jobsTable: core.jobsTable,
-  jobsQueue: core.jobsQueue,
   workflow: core.jobsStateMachine,
 });
