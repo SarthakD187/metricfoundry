@@ -1,7 +1,8 @@
 import json
 import os
 import time
-from typing import Dict
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Protocol
 
 import boto3
 from botocore.exceptions import ClientError
@@ -60,8 +61,118 @@ def object_exists(bucket: str, key: str) -> bool:
 
 _NULL_SENTINELS = {None, "", "null", "NULL", "NaN", "nan"}
 
+ANALYSIS_VERSION = "2024.05"
 
-def compute_metrics_from_csv(body: bytes) -> Dict[str, object]:
+
+@dataclass
+class DatasetDescriptor:
+    """Lightweight summary of the ingested dataset."""
+
+    rows: int | None
+    columns: List[str]
+    null_counts: Dict[str, int]
+
+
+class AnalyticsContext:
+    """Shared state that steps can use to communicate results."""
+
+    def __init__(self, job_id: str, source_key: str, dataset: DatasetDescriptor):
+        self.job_id = job_id
+        self.source_key = source_key
+        self.dataset = dataset
+        self.results: Dict[str, Dict[str, Any]] = {}
+
+    def record(self, step_name: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        result = dict(payload)
+        self.results[step_name] = result
+        return result
+
+
+class AnalyticsStep(Protocol):
+    name: str
+
+    def run(self, context: AnalyticsContext) -> Mapping[str, Any]:
+        ...
+
+
+class ProfilingStep:
+    name = "profiling"
+
+    def run(self, context: AnalyticsContext) -> Mapping[str, Any]:
+        dataset = context.dataset
+        return context.record(
+            self.name,
+            {
+                "rows": dataset.rows,
+                "columns": dataset.columns,
+                "source": context.source_key,
+            },
+        )
+
+
+class StatisticsStep:
+    name = "statistics"
+
+    def run(self, context: AnalyticsContext) -> Mapping[str, Any]:
+        dataset = context.dataset
+        return context.record(
+            self.name,
+            {
+                "null_counts": dataset.null_counts,
+            },
+        )
+
+
+class VisualizationStep:
+    name = "visualizations"
+
+    def run(self, context: AnalyticsContext) -> Mapping[str, Any]:
+        return context.record(
+            self.name,
+            {
+                "artifacts": [],
+                "status": "pending",
+                "message": "Visualization rendering not yet implemented.",
+            },
+        )
+
+
+class MLInferenceStep:
+    name = "ml_inference"
+
+    def run(self, context: AnalyticsContext) -> Mapping[str, Any]:
+        return context.record(
+            self.name,
+            {
+                "models": [],
+                "status": "pending",
+                "message": "ML inference pipeline not yet implemented.",
+            },
+        )
+
+
+class AnalyticsWorkflow:
+    """Coordinator that executes analytics steps sequentially."""
+
+    def __init__(self, steps: List[AnalyticsStep]):
+        self.steps = steps
+
+    def run(self, context: AnalyticsContext) -> Dict[str, Dict[str, Any]]:
+        for step in self.steps:
+            try:
+                step.run(context)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                context.record(
+                    step.name,
+                    {
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                raise
+        return context.results
+
+
+def _compute_descriptor_from_csv(body: bytes) -> DatasetDescriptor:
     import csv
     import io
 
@@ -75,17 +186,17 @@ def compute_metrics_from_csv(body: bytes) -> Dict[str, object]:
         for c in cols:
             if row.get(c) in _NULL_SENTINELS:
                 nulls[c] += 1
-    return {"rows": rows, "columns": cols, "null_counts": nulls}
+    return DatasetDescriptor(rows=rows, columns=cols, null_counts=nulls)
 
 
-def compute_metrics_from_json(body: bytes) -> Dict[str, object]:
+def _compute_descriptor_from_json(body: bytes) -> DatasetDescriptor:
     data = json.loads(body)
     records = data if isinstance(data, list) else [data]
     cols = sorted({k for r in records if isinstance(r, dict) for k in r.keys()})
-    return {"rows": len(records), "columns": cols, "null_counts": {}}
+    return DatasetDescriptor(rows=len(records), columns=cols, null_counts={})
 
 
-def compute_metrics_from_jsonl(body: bytes) -> Dict[str, object]:
+def _compute_descriptor_from_jsonl(body: bytes) -> DatasetDescriptor:
     text = body.decode("utf-8", errors="replace")
     cols_set = set()
     rows = 0
@@ -100,18 +211,47 @@ def compute_metrics_from_jsonl(body: bytes) -> Dict[str, object]:
         rows += 1
         if isinstance(obj, dict):
             cols_set.update(obj.keys())
-    return {"rows": rows, "columns": sorted(cols_set), "null_counts": {}}
+    return DatasetDescriptor(rows=rows, columns=sorted(cols_set), null_counts={})
 
 
-def compute_metrics(key: str, body: bytes) -> Dict[str, object]:
+def compute_dataset_descriptor(key: str, body: bytes) -> DatasetDescriptor:
     k = key.lower()
     if k.endswith(".csv"):
-        return compute_metrics_from_csv(body)
+        return _compute_descriptor_from_csv(body)
     if k.endswith(".jsonl") or k.endswith(".ndjson"):
-        return compute_metrics_from_jsonl(body)
+        return _compute_descriptor_from_jsonl(body)
     if k.endswith(".json"):
-        return compute_metrics_from_json(body)
-    return {"rows": None, "columns": [], "null_counts": {}}
+        return _compute_descriptor_from_json(body)
+    return DatasetDescriptor(rows=None, columns=[], null_counts={})
+
+
+def run_workflow(job_id: str, key: str, body: bytes) -> Dict[str, Any]:
+    descriptor = compute_dataset_descriptor(key, body)
+    context = AnalyticsContext(job_id=job_id, source_key=key, dataset=descriptor)
+    workflow = AnalyticsWorkflow(
+        [
+            ProfilingStep(),
+            StatisticsStep(),
+            VisualizationStep(),
+            MLInferenceStep(),
+        ]
+    )
+    phases = workflow.run(context)
+
+    metrics: Dict[str, Any] = {}
+    profiling = phases.get("profiling", {})
+    statistics = phases.get("statistics", {})
+    if profiling:
+        metrics.update({k: profiling.get(k) for k in ("rows", "columns")})
+    if statistics:
+        metrics["null_counts"] = statistics.get("null_counts", {})
+
+    return {
+        "jobId": job_id,
+        "analysisVersion": ANALYSIS_VERSION,
+        "phases": phases,
+        "metrics": metrics,
+    }
 
 
 def main(event, _ctx):
@@ -145,13 +285,13 @@ def main(event, _ctx):
         obj = s3.get_object(Bucket=bucket, Key=key)
         body = obj["Body"].read()
 
-        metrics = compute_metrics(key, body)
+        results = run_workflow(job_id, key, body)
 
         target_bucket = ARTIFACTS_BUCKET or bucket
         s3.put_object(
             Bucket=target_bucket,
             Key=rkey,
-            Body=json.dumps({"jobId": job_id, "metrics": metrics}, indent=2).encode(),
+            Body=json.dumps(results, indent=2).encode(),
             ContentType="application/json",
         )
 
