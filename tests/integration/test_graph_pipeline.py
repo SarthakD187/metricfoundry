@@ -189,10 +189,14 @@ def test_pipeline_ingests_diverse_formats(key, body, expected_format):
     manifest_keys = {entry["key"] for entry in result.manifest["artifacts"]}
     assert f"artifacts/{job_id}/results/results.json" in manifest_keys
     assert f"artifacts/{job_id}/results/manifest.json" in manifest_keys
+    assert f"artifacts/{job_id}/results/bundles/analytics_bundle.zip" in manifest_keys
+    assert f"artifacts/{job_id}/phases/phase_payloads.zip" in manifest_keys
 
     contents_keys = result.artifact_contents.keys()
     assert "results/descriptive_stats.csv" in contents_keys
     assert "results/report.txt" in contents_keys
+    assert "results/bundles/analytics_bundle.zip" in contents_keys
+    assert "phases/phase_payloads.zip" in contents_keys
 
     ml_phase = result.phases["ml_inference"]
     assert isinstance(ml_phase, dict)
