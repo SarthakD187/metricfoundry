@@ -5,12 +5,15 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as ddb from "aws-cdk-lib/aws-dynamodb";
 import * as lambda from "aws-cdk-lib/aws-lambda";
-import * as s3n from "aws-cdk-lib/aws-s3-notifications";
+import * as iam from "aws-cdk-lib/aws-iam";
+import * as sfn from "aws-cdk-lib/aws-stepfunctions";
+import * as tasks from "aws-cdk-lib/aws-stepfunctions-tasks";
 
 export class MetricFoundryCoreStack extends Stack {
   public readonly artifacts: s3.Bucket;
   public readonly jobsQueue: sqs.Queue;
   public readonly jobsTable: ddb.Table;
+  public readonly jobsStateMachine: sfn.StateMachine;
 
   constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
@@ -52,7 +55,47 @@ export class MetricFoundryCoreStack extends Stack {
     });
 
     // =====================================================================
-    // Worker Lambda: process uploads and write results + status to JobsTable
+    // Stage Lambda: normalize source data into the artifacts bucket
+    // =====================================================================
+    const stageFn = new lambda.Function(this, "StageSourceFn", {
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "handler.handler",
+      code: lambda.Code.fromAsset("lambdas/stage"),
+      timeout: Duration.minutes(2),
+      memorySize: 512,
+      environment: {
+        JOBS_TABLE: this.jobsTable.tableName,
+        ARTIFACTS_BUCKET: this.artifacts.bucketName,
+      },
+    });
+
+    this.artifacts.grantReadWrite(stageFn);
+    this.jobsTable.grantReadWriteData(stageFn);
+    stageFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["s3:GetObject"],
+        resources: ["arn:aws:s3:::*/*"],
+      })
+    );
+
+    // =====================================================================
+    // Status Lambda: used by the workflow to record terminal failures
+    // =====================================================================
+    const statusFn = new lambda.Function(this, "StatusFn", {
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "handler.handler",
+      code: lambda.Code.fromAsset("lambdas/status"),
+      timeout: Duration.seconds(30),
+      memorySize: 256,
+      environment: {
+        JOBS_TABLE: this.jobsTable.tableName,
+      },
+    });
+
+    this.jobsTable.grantReadWriteData(statusFn);
+
+    // =====================================================================
+    // Processor Lambda: invoked by Step Functions after staging completes
     // =====================================================================
     const processorFn = new lambda.Function(this, "ProcessorFn", {
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -66,25 +109,75 @@ export class MetricFoundryCoreStack extends Stack {
       },
     });
 
-    // Permissions for worker
     this.artifacts.grantReadWrite(processorFn);
     this.jobsTable.grantReadWriteData(processorFn);
 
-    // S3 -> Lambda notification on new objects under artifacts/
-    // (We filter to the top-level 'artifacts/' prefix here and enforce '/input/' in code)
-    // Listen to ALL object-created events under artifacts/
-this.artifacts.addEventNotification(
-  s3.EventType.OBJECT_CREATED,               // <-- broader than PUT
-  new s3n.LambdaDestination(processorFn),
-  { prefix: "artifacts/" }
-);
+    // =====================================================================
+    // Step Functions state machine orchestrating staging + processing
+    // =====================================================================
+    const stageTask = new tasks.LambdaInvoke(this, "StageSource", {
+      lambdaFunction: stageFn,
+      payload: sfn.TaskInput.fromObject({
+        jobId: sfn.JsonPath.stringAt("$.jobId"),
+      }),
+      resultPath: "$.stage",
+      payloadResponseOnly: true,
+    });
 
-// Also listen under jobs/ (your API presigns here)
-this.artifacts.addEventNotification(
-  s3.EventType.OBJECT_CREATED,               // <-- broader than PUT
-  new s3n.LambdaDestination(processorFn),
-  { prefix: "jobs/" }
-);
+    stageTask.addRetry({
+      errors: ["FileNotReadyError"],
+      interval: Duration.seconds(20),
+      backoffRate: 1.5,
+      maxAttempts: 15,
+    });
 
+    const markStageFailed = new tasks.LambdaInvoke(this, "MarkStageFailed", {
+      lambdaFunction: statusFn,
+      payload: sfn.TaskInput.fromObject({
+        jobId: sfn.JsonPath.stringAt("$.jobId"),
+        error: sfn.JsonPath.stringAt("$.stageError.Cause"),
+      }),
+      payloadResponseOnly: true,
+      resultPath: sfn.JsonPath.DISCARD,
+    });
+
+    const stageFailed = new sfn.Fail(this, "StageFailed");
+    const stageFailureChain = markStageFailed.next(stageFailed);
+
+    stageTask.addCatch(stageFailureChain, {
+      errors: ["States.ALL"],
+      resultPath: "$.stageError",
+    });
+
+    const processTask = new tasks.LambdaInvoke(this, "ProcessJob", {
+      lambdaFunction: processorFn,
+      payload: sfn.TaskInput.fromObject({
+        jobId: sfn.JsonPath.stringAt("$.jobId"),
+        input: sfn.JsonPath.stringAt("$.stage.input"),
+      }),
+      resultPath: "$.process",
+      payloadResponseOnly: true,
+    });
+
+    const markProcessFailed = new tasks.LambdaInvoke(this, "MarkProcessFailed", {
+      lambdaFunction: statusFn,
+      payload: sfn.TaskInput.fromObject({
+        jobId: sfn.JsonPath.stringAt("$.jobId"),
+        error: sfn.JsonPath.stringAt("$.processError.Cause"),
+      }),
+      payloadResponseOnly: true,
+      resultPath: sfn.JsonPath.DISCARD,
+    });
+
+    const processFailed = new sfn.Fail(this, "ProcessFailed");
+    processTask.addCatch(markProcessFailed.next(processFailed), {
+      errors: ["States.ALL"],
+      resultPath: "$.processError",
+    });
+
+    this.jobsStateMachine = new sfn.StateMachine(this, "JobsStateMachine", {
+      definition: stageTask.next(processTask),
+      timeout: Duration.minutes(15),
+    });
   }
 }
