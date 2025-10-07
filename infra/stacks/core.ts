@@ -51,7 +51,19 @@ export class MetricFoundryCoreStack extends Stack {
     const stageFn = new lambda.Function(this, "StageSourceFn", {
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: "handler.handler",
-      code: lambda.Code.fromAsset("lambdas/stage"),
+      code: lambda.Code.fromAsset("lambdas/stage", {
+        bundling: {
+          image: lambda.Runtime.PYTHON_3_12.bundlingImage,
+          command: [
+            "bash",
+            "-c",
+            [
+              "pip install -r requirements.txt -t /asset-output",
+              "cp -au . /asset-output",
+            ].join(" && "),
+          ],
+        },
+      }),
       timeout: Duration.minutes(2),
       memorySize: 512,
       environment: {
