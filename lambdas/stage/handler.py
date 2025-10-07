@@ -1,8 +1,15 @@
-"""Lambda to stage job source data into the artifacts bucket."""
+"""Lambda to stage job source data into the artifacts bucket.
+
+The staging task is responsible for normalising every supported source into a
+consistent layout within the artifacts bucket.  As new connectors are added we
+only need to plug them into the dispatcher below – the rest of the orchestration
+remains unchanged.
+"""
+
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import boto3
 from botocore.exceptions import ClientError
@@ -58,6 +65,18 @@ class SourceRef:
         return self.key.rsplit("/", 1)[-1]
 
 
+@dataclass
+class StagedArtifact:
+    bucket: str
+    key: str
+    size: Optional[int]
+    content_type: Optional[str]
+
+    @property
+    def path(self) -> str:
+        return f"s3://{self.bucket}/{self.key}"
+
+
 def _parse_source(item: Dict[str, Dict]) -> Tuple[SourceRef, str]:
     source = item.get("source") or {}
     source_type = source.get("type")
@@ -103,6 +122,44 @@ def _copy_object(src: SourceRef, dest_key: str) -> None:
     )
 
 
+def _detect_format(key: str, content_type: Optional[str]) -> str:
+    name = key.lower()
+    if name.endswith(".csv"):
+        return "csv"
+    if name.endswith(".jsonl") or name.endswith(".ndjson"):
+        return "jsonl"
+    if name.endswith(".json"):
+        return "json"
+
+    if content_type:
+        ct = content_type.lower()
+        if "csv" in ct:
+            return "csv"
+        if "json" in ct:
+            # Handles generic JSON content types as a fallback.
+            return "json"
+
+    return "unknown"
+
+
+def _stage_source(job_id: str, src: SourceRef) -> StagedArtifact:
+    filename = src.filename or "source"
+    dest_key = f"artifacts/{job_id}/input/{filename}"
+
+    _copy_object(src, dest_key)
+
+    head = s3.head_object(Bucket=ARTIFACTS_BUCKET, Key=dest_key)
+    size = head.get("ContentLength")
+    content_type = head.get("ContentType")
+
+    return StagedArtifact(
+        bucket=ARTIFACTS_BUCKET,
+        key=dest_key,
+        size=size,
+        content_type=content_type,
+    )
+
+
 def handler(event, _context):
     job_id = event.get("jobId")
     if not job_id:
@@ -124,11 +181,8 @@ def handler(event, _context):
     if source_type == "upload":
         _wait_for_upload(src)
 
-    filename = src.filename or "source"
-    dest_key = f"artifacts/{job_id}/input/{filename}"
-
     try:
-        _copy_object(src, dest_key)
+        staged = _stage_source(job_id, src)
     except FileNotReadyError:
         # Should never reach here due to early check, but propagate just in case.
         raise
@@ -137,11 +191,26 @@ def handler(event, _context):
         _ddb_update(job_id, STATUS_FAILED, error=str(exc))
         raise
 
-    _ddb_update(job_id, STATUS_STAGED, inputKey=dest_key)
+    fmt = _detect_format(staged.key, staged.content_type)
 
-    print(f"[Stage] Staged data at s3://{ARTIFACTS_BUCKET}/{dest_key}")
+    metadata = {
+        "size": staged.size,
+        "format": fmt,
+        "contentType": staged.content_type,
+        "sourceType": source_type,
+    }
+
+    _ddb_update(
+        job_id,
+        STATUS_STAGED,
+        inputKey=staged.key,
+        inputMetadata=metadata,
+    )
+
+    print(f"[Stage] Staged data at {staged.path} (format={fmt}, size={staged.size})")
 
     return {
         "jobId": job_id,
-        "input": {"bucket": ARTIFACTS_BUCKET, "key": dest_key},
+        "input": {"bucket": staged.bucket, "key": staged.key},
+        "metadata": metadata,
     }
