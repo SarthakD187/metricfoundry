@@ -18,7 +18,6 @@ from pydantic import BaseModel
 # ---- Env ----
 BUCKET_NAME = os.environ["BUCKET_NAME"]          # artifacts bucket
 TABLE_NAME  = os.environ["TABLE_NAME"]           # DynamoDB table
-QUEUE_URL   = os.environ.get("QUEUE_URL")        # optional
 STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
 
 # ---- Logging & Observability ----

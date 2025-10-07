@@ -2,7 +2,6 @@
 import { Stack, StackProps, Duration } from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as lambda from "aws-cdk-lib/aws-lambda";
-import * as iam from "aws-cdk-lib/aws-iam";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as integrations from "aws-cdk-lib/aws-apigatewayv2-integrations";
 import * as sfn from "aws-cdk-lib/aws-stepfunctions";
@@ -10,7 +9,6 @@ import * as sfn from "aws-cdk-lib/aws-stepfunctions";
 interface MetricFoundryApiStackProps extends StackProps {
   artifactsBucket: any;
   jobsTable: any;
-  jobsQueue?: any;
   workflow: sfn.StateMachine;
 }
 
@@ -18,7 +16,7 @@ export class MetricFoundryApiStack extends Stack {
   constructor(scope: Construct, id: string, props: MetricFoundryApiStackProps) {
     super(scope, id, props);
 
-    const { artifactsBucket, jobsTable, jobsQueue, workflow } = props;
+    const { artifactsBucket, jobsTable, workflow } = props;
 
     // ------------------------------------------------------------------------
     // API Lambda (FastAPI + Mangum)
@@ -32,7 +30,6 @@ export class MetricFoundryApiStack extends Stack {
       environment: {
         BUCKET_NAME: artifactsBucket.bucketName,
         TABLE_NAME: jobsTable.tableName,
-        QUEUE_URL: jobsQueue ? jobsQueue.queueUrl : "",
         STATE_MACHINE_ARN: workflow.stateMachineArn,
       },
     });
@@ -43,15 +40,6 @@ export class MetricFoundryApiStack extends Stack {
     artifactsBucket.grantReadWrite(apiFn);
     jobsTable.grantReadWriteData(apiFn);
     workflow.grantStartExecution(apiFn);
-
-    if (jobsQueue) {
-      apiFn.addToRolePolicy(
-        new iam.PolicyStatement({
-          actions: ["sqs:SendMessage"],
-          resources: [jobsQueue.queueArn],
-        })
-      );
-    }
 
     // ------------------------------------------------------------------------
     // HTTP API Gateway
