@@ -32,6 +32,14 @@ field, enabling teams to declaratively pull data from almost any system:
 This connector catalogue underpins the platform's "any dataset" promise while
 keeping the job orchestration API consistent for every source type.
 
+## Scalability & workflow resilience
+
+Large ingestion jobs now benefit from more generous Lambda resource profiles:
+the staging function has a 10-minute timeout with 2 GB of memory, while the
+analytics processor runs for up to 15 minutes with 4 GB available. These
+headroom increases allow bigger files and more complex enrichment logic to
+complete without falling back to retries.
+
 ## API hardening & observability
 
 The FastAPI service that fronts the ingestion workflow now exposes endpoints
@@ -60,4 +68,12 @@ validation logic. Run them locally with:
 ```bash
 pip install -r services/api/requirements-dev.txt
 pytest services/api/tests
+```
+
+Additional integration suites exercise the public API and workflow orchestration
+end-to-end, covering job creation, Step Functions launches, artifact discovery,
+and result downloads:
+
+```bash
+pytest tests/integration/test_api_workflow.py
 ```
