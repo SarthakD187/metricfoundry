@@ -633,6 +633,99 @@ def _with_phase(state: MutableMapping[str, Any], phase: str, payload: Dict[str, 
     return update
 
 
+def _artifact_bytes_for_bundle(spec: Mapping[str, Any]) -> Optional[bytes]:
+    kind = spec.get("kind")
+    if kind == "json":
+        return json.dumps(spec.get("data"), indent=2, default=str).encode("utf-8")
+    if kind == "text":
+        text = spec.get("text", "")
+        if not isinstance(text, str):
+            text = str(text)
+        return text.encode("utf-8")
+    if kind == "csv":
+        headers = list(spec.get("headers", []))
+        rows = list(spec.get("rows", []))
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=headers)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({header: row.get(header, "") for header in headers})
+        return output.getvalue().encode("utf-8")
+    if kind in {"image", "binary"}:
+        data = spec.get("data", b"")
+        if isinstance(data, memoryview):  # pragma: no cover - defensive conversion
+            data = data.tobytes()
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        return None
+    return None
+
+
+def _zip_bytes_for(files: Mapping[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path, data in files.items():
+            archive.writestr(path, data)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _build_curated_bundles(
+    phases: Mapping[str, Mapping[str, Any]],
+    artifact_contents: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    bundles: Dict[str, Dict[str, Any]] = {}
+
+    summary_files: Dict[str, bytes] = {}
+    visualization_files: Dict[str, bytes] = {}
+
+    for relative_key, spec in artifact_contents.items():
+        if relative_key.startswith("results/bundles/"):
+            continue
+        body = _artifact_bytes_for_bundle(spec)
+        if body is None:
+            continue
+        if relative_key.startswith("results/graphs/"):
+            visualization_files[relative_key[len("results/graphs/"):]] = body
+        elif relative_key.startswith("results/"):
+            summary_files[relative_key[len("results/"):]] = body
+
+    if summary_files:
+        bundles["results/bundles/analytics_bundle.zip"] = {
+            "kind": "binary",
+            "data": _zip_bytes_for(summary_files),
+            "description": (
+                "Curated archive containing descriptive statistics, correlations, "
+                "outliers, reports, and other tabular result artifacts."
+            ),
+            "contentType": "application/zip",
+        }
+
+    if visualization_files:
+        bundles["results/bundles/visualizations.zip"] = {
+            "kind": "binary",
+            "data": _zip_bytes_for(visualization_files),
+            "description": (
+                "PNG visualisations generated during analysis, grouped for quick download."
+            ),
+            "contentType": "application/zip",
+        }
+
+    phase_payloads: Dict[str, bytes] = {}
+    for phase_name, payload in phases.items():
+        phase_payloads[f"{phase_name}.json"] = json.dumps(payload, indent=2, default=str).encode("utf-8")
+
+    if phase_payloads:
+        bundles["phases/phase_payloads.zip"] = {
+            "kind": "binary",
+            "data": _zip_bytes_for(phase_payloads),
+            "description": "Combined JSON payloads emitted by each pipeline phase.",
+            "contentType": "application/zip",
+        }
+
+    return bundles
+
+
 def _emit_callback(state: Mapping[str, Any], phase: str, payload: Mapping[str, Any]) -> None:
     callback = state.get("_callback")
     if not callable(callback):
@@ -1633,6 +1726,11 @@ def finalize_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
         }
 
     artifact_prefix: str = state.get("artifact_prefix", "artifacts")
+    existing_artifacts: Dict[str, Dict[str, Any]] = dict(state.get("artifact_contents", {}))
+    bundle_artifacts = _build_curated_bundles(phases, existing_artifacts)
+    artifact_contents = dict(existing_artifacts)
+    artifact_contents.update(bundle_artifacts)
+
     manifest_entries: List[Dict[str, Any]] = []
     for phase in PHASE_ORDER:
         if phase not in phases:
@@ -1646,7 +1744,7 @@ def finalize_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
             }
         )
 
-    for relative_key, spec in state.get("artifact_contents", {}).items():
+    for relative_key, spec in artifact_contents.items():
         manifest_entries.append(
             {
                 "name": relative_key.replace("/", "_"),
@@ -1685,7 +1783,7 @@ def finalize_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
         "mlInference": ml_inference_payload,
     }
 
-    update = _with_phase(state, "finalize", payload, manifest=manifest, final_summary={
+    update = _with_phase(state, "finalize", payload, manifest=manifest, artifact_contents=artifact_contents, final_summary={
         "metrics": metrics,
         "correlations": correlations,
         "outliers": outliers,

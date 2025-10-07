@@ -12,14 +12,18 @@ artifacts/<jobId>/
 │   ├── dq_validate.json
 │   ├── descriptive_stats.json
 │   ├── nl_report.json
-│   └── finalize.json
+│   ├── finalize.json
+│   └── phase_payloads.zip
 └── results/
     ├── correlations.csv
     ├── descriptive_stats.csv
     ├── manifest.json
     ├── outliers.json
     ├── report.txt
-    └── results.json
+    ├── results.json
+    └── bundles/
+        ├── analytics_bundle.zip
+        └── visualizations.zip
 ```
 
 ## Phase artifacts
@@ -42,7 +46,18 @@ phases:
 - `outliers.json` – detected outliers for numeric fields along with z-scores.
 - `report.txt` – natural-language summary for quick operator review.
 - `graphs/` – PNG visualizations such as histograms and scatter plots for quick exploration of numeric fields.
+- `bundles/analytics_bundle.zip` – curated download that groups descriptive
+  statistics, correlation matrices, predictions, and other tabular outputs.
+- `bundles/visualizations.zip` – single archive containing all generated
+  histograms and scatter plots.
 
 Additional artifacts added by future phases (plots, models, etc.) should follow
 this pattern and be registered in the manifest under `artifacts/` with the
 relative key `artifacts/<jobId>/<path>`.
+
+## Phase archives
+
+To simplify debugging, `phases/phase_payloads.zip` consolidates the individual
+`<phase>.json` documents emitted by the LangGraph pipeline into a single
+downloadable archive. This removes the need to fetch each phase output one at a
+time when inspecting job execution details.
