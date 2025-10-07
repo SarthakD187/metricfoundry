@@ -9,5 +9,6 @@
     "rootDir": ".",
     "types": ["node"]
   },
-  "include": ["infra/**/*.ts", "**/*.ts"]
+  "include": ["infra/**/*.ts", "**/*.ts"],
+  "exclude": ["dashboard/**"]
 }
