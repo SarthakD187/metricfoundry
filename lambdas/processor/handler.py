@@ -112,6 +112,13 @@ def _persist_artifact(bucket: str, key: str, spec: Mapping[str, Any]) -> None:
         if not isinstance(data, (bytes, bytearray)):
             raise ValueError("Image artifact data must be bytes-like")
         body = bytes(data)
+    elif kind == "binary":
+        data = spec.get("data", b"")
+        if isinstance(data, memoryview):
+            data = data.tobytes()
+        if not isinstance(data, (bytes, bytearray)):
+            raise ValueError("Binary artifact data must be bytes-like")
+        body = bytes(data)
     else:
         raise ValueError(f"Unsupported artifact kind: {kind}")
     _put_object(bucket, key, body, content_type)
