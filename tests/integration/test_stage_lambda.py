@@ -1,5 +1,6 @@
 import importlib
 import io
+import json
 import hashlib
 import sqlite3
 from datetime import datetime, timezone
@@ -107,6 +108,32 @@ class FakeDynamoResource:
         return self._table
 
 
+class FakeSecretsManager:
+    def __init__(self) -> None:
+        self._secrets: Dict[str, str] = {}
+
+    def put_secret(self, arn: str, value: str):
+        self._secrets[arn] = value
+
+    def get_secret_value(self, SecretId: str):  # noqa: N802 - mimic boto3
+        if SecretId not in self._secrets:
+            raise _client_error("ResourceNotFoundException", "GetSecretValue")
+        return {"ARN": SecretId, "SecretString": self._secrets[SecretId]}
+
+
+class FakeSSM:
+    def __init__(self) -> None:
+        self._parameters: Dict[str, str] = {}
+
+    def put_parameter(self, Name: str, Value: str):  # noqa: N802 - mimic boto3
+        self._parameters[Name] = Value
+
+    def get_parameter(self, Name: str, WithDecryption: bool = False):  # noqa: N802 - mimic boto3
+        if Name not in self._parameters:
+            raise _client_error("ParameterNotFound", "GetParameter")
+        return {"Parameter": {"Name": Name, "Value": self._parameters[Name]}}
+
+
 @pytest.fixture()
 def stage_lambda(monkeypatch):
     monkeypatch.setenv("JOBS_TABLE", "jobs-table")
@@ -126,11 +153,15 @@ def stage_lambda(monkeypatch):
 
     fake_s3 = FakeS3()
     fake_table = FakeDynamoTable()
+    fake_secrets = FakeSecretsManager()
+    fake_ssm = FakeSSM()
 
     module.s3 = fake_s3
     module.ddb = FakeDynamoResource(fake_table)
+    module.secretsmanager = fake_secrets
+    module.ssm = fake_ssm
 
-    return module, fake_s3, fake_table
+    return module, fake_s3, fake_table, fake_secrets, fake_ssm
 
 
 @pytest.mark.parametrize(
@@ -163,7 +194,7 @@ def stage_lambda(monkeypatch):
     ],
 )
 def test_stage_lambda_end_to_end(stage_lambda, job_source, bucket, key, body, content_type, expected_format):
-    module, fake_s3, fake_table = stage_lambda
+    module, fake_s3, fake_table, _, _ = stage_lambda
     job_id = f"job-{expected_format}"
 
     fake_table.put_item(
@@ -198,7 +229,7 @@ def test_stage_lambda_end_to_end(stage_lambda, job_source, bucket, key, body, co
 
 
 def test_stage_lambda_http_connector(stage_lambda, monkeypatch):
-    module, fake_s3, fake_table = stage_lambda
+    module, fake_s3, fake_table, _, _ = stage_lambda
     job_id = "job-http"
     payload = b"id,value\n1,99\n"
 
@@ -233,7 +264,7 @@ def test_stage_lambda_http_connector(stage_lambda, monkeypatch):
 
 
 def test_stage_lambda_sqlite_connector(stage_lambda, tmp_path):
-    module, fake_s3, fake_table = stage_lambda
+    module, fake_s3, fake_table, _, _ = stage_lambda
     job_id = "job-sqlite"
 
     db_path = tmp_path / "example.db"
@@ -269,7 +300,7 @@ def test_stage_lambda_sqlite_connector(stage_lambda, tmp_path):
 
 
 def test_stage_lambda_warehouse_metadata(stage_lambda, tmp_path):
-    module, fake_s3, fake_table = stage_lambda
+    module, fake_s3, fake_table, _, _ = stage_lambda
     job_id = "job-warehouse"
 
     db_path = tmp_path / "warehouse.db"
@@ -297,3 +328,78 @@ def test_stage_lambda_warehouse_metadata(stage_lambda, tmp_path):
 
     record = fake_table.get_item({"pk": f"job#{job_id}", "sk": "meta"}).get("Item")
     assert record["inputMetadata"]["sourceType"] == "warehouse:snowflake"
+
+
+def test_stage_lambda_database_secret(stage_lambda, tmp_path):
+    module, fake_s3, fake_table, fake_secrets, _ = stage_lambda
+    job_id = "job-secret"
+
+    db_path = tmp_path / "secret.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE secrets(id INTEGER PRIMARY KEY, value INTEGER)")
+    conn.execute("INSERT INTO secrets(value) VALUES (9)")
+    conn.commit()
+    conn.close()
+
+    secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:database"
+    fake_secrets.put_secret(secret_arn, json.dumps({"url": f"sqlite:///{db_path}"}))
+
+    fake_table.put_item(
+        {
+            "pk": f"job#{job_id}",
+            "sk": "meta",
+            "status": "QUEUED",
+            "source": {
+                "type": "database",
+                "secretArn": secret_arn,
+                "secretField": "url",
+                "query": "SELECT value FROM secrets",
+                "filename": "secret.csv",
+            },
+        }
+    )
+
+    result = module.handler({"jobId": job_id}, None)
+
+    expected_key = f"artifacts/{job_id}/input/secret.csv"
+    obj = fake_s3.get_object(Bucket=module.ARTIFACTS_BUCKET, Key=expected_key)
+    body = obj["Body"].read().decode("utf-8")
+    assert "value" in body
+    assert "9" in body
+    assert result["metadata"]["sourceType"] == "database"
+
+
+def test_stage_lambda_database_parameter(stage_lambda, tmp_path):
+    module, fake_s3, fake_table, _, fake_ssm = stage_lambda
+    job_id = "job-parameter"
+
+    db_path = tmp_path / "parameter.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE parameters(id INTEGER PRIMARY KEY, value INTEGER)")
+    conn.execute("INSERT INTO parameters(value) VALUES (5)")
+    conn.commit()
+    conn.close()
+
+    parameter_name = "/metricfoundry/databases/parameter"
+    fake_ssm.put_parameter(Name=parameter_name, Value=f"sqlite:///{db_path}")
+
+    fake_table.put_item(
+        {
+            "pk": f"job#{job_id}",
+            "sk": "meta",
+            "status": "QUEUED",
+            "source": {
+                "type": "database",
+                "parameterName": parameter_name,
+                "query": "SELECT value FROM parameters",
+            },
+        }
+    )
+
+    module.handler({"jobId": job_id}, None)
+
+    expected_key = f"artifacts/{job_id}/input/database-export.csv"
+    obj = fake_s3.get_object(Bucket=module.ARTIFACTS_BUCKET, Key=expected_key)
+    body = obj["Body"].read().decode("utf-8")
+    assert "value" in body
+    assert "5" in body

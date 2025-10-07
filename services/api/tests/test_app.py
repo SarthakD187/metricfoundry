@@ -68,7 +68,17 @@ def test_create_database_job_requires_config(api_app):
     client = api_app["client"]
     response = client.post("/jobs", json={"source_type": "database"})
     assert response.status_code == 400
-    assert "database jobs require url and query" in response.json()["detail"]
+    assert "database jobs require query" in response.json()["detail"]
+
+    response = client.post(
+        "/jobs",
+        json={
+            "source_type": "database",
+            "source_config": {"query": "SELECT 1"},
+        },
+    )
+    assert response.status_code == 400
+    assert "connection reference" in response.json()["detail"]
 
     response = client.post(
         "/jobs",
@@ -81,6 +91,43 @@ def test_create_database_job_requires_config(api_app):
     job_id = response.json()["jobId"]
     record = api_app["module"].table.get_item({"pk": f"job#{job_id}", "sk": "meta"}).get("Item")
     assert record["source"]["format"] == "jsonl"
+
+
+def test_create_database_job_with_secret(api_app):
+    client = api_app["client"]
+    response = client.post(
+        "/jobs",
+        json={
+            "source_type": "database",
+            "source_config": {
+                "query": "SELECT 1",
+                "secretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:database",
+                "secretField": "url",
+            },
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["jobId"]
+    record = api_app["module"].table.get_item({"pk": f"job#{job_id}", "sk": "meta"}).get("Item")
+    assert record["source"]["secretArn"].endswith(":database")
+    assert record["source"]["secretField"] == "url"
+
+
+def test_create_database_job_rejects_multiple_connections(api_app):
+    client = api_app["client"]
+    response = client.post(
+        "/jobs",
+        json={
+            "source_type": "database",
+            "source_config": {
+                "url": "sqlite:///tmp/example.db",
+                "secretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:database",
+                "query": "SELECT 1",
+            },
+        },
+    )
+    assert response.status_code == 400
+    assert "only one connection" in response.json()["detail"]
 
 
 def test_create_warehouse_job_validation(api_app):
@@ -101,8 +148,8 @@ def test_create_warehouse_job_validation(api_app):
             "source_type": "warehouse",
             "source_config": {
                 "warehouseType": "snowflake",
-                "url": "sqlite:///tmp/example.db",
                 "query": "SELECT 1",
+                "secretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:warehouse",
                 "filename": "warehouse-output.csv",
             },
         },
@@ -111,6 +158,7 @@ def test_create_warehouse_job_validation(api_app):
     record = api_app["module"].table.get_item({"pk": f"job#{response.json()['jobId']}", "sk": "meta"}).get("Item")
     assert record["source"]["warehouseType"] == "snowflake"
     assert record["source"]["filename"] == "warehouse-output.csv"
+    assert record["source"]["secretArn"].endswith(":warehouse")
 
 
 @pytest.mark.parametrize("path,expected_status", [(None, 200), ("data.csv", 200), ("missing.csv", 404)])

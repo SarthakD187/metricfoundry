@@ -109,16 +109,31 @@ def _build_source(body: CreateJob, job_id: str) -> tuple[dict, Optional[str]]:
     if source_type == "database":
         url = config.get("url")
         query = config.get("query")
-        if not url or not query:
-            raise HTTPException(status_code=400, detail="database jobs require url and query in source_config")
+        secret_arn = config.get("secretArn")
+        parameter_name = config.get("parameterName")
+        secret_field = config.get("secretField")
+        if not query:
+            raise HTTPException(status_code=400, detail="database jobs require query in source_config")
+        provided_connections = [value for value in [url, secret_arn, parameter_name] if value]
+        if not provided_connections:
+            raise HTTPException(status_code=400, detail="database jobs require a connection reference (url, secretArn, or parameterName)")
+        if len(provided_connections) > 1:
+            raise HTTPException(status_code=400, detail="database jobs must specify only one connection reference")
         source = {
             "type": "database",
-            "url": url,
             "query": query,
             "params": config.get("params"),
             "filename": config.get("filename"),
             "format": config.get("format", "csv"),
         }
+        if url:
+            source["url"] = url
+        if secret_arn:
+            source["secretArn"] = secret_arn
+        if parameter_name:
+            source["parameterName"] = parameter_name
+        if secret_field:
+            source["secretField"] = secret_field
         return _clean_config(source), None
 
     if source_type == "warehouse":
@@ -127,17 +142,32 @@ def _build_source(body: CreateJob, job_id: str) -> tuple[dict, Optional[str]]:
             raise HTTPException(status_code=400, detail="warehouseType must be redshift, snowflake, bigquery, or databricks")
         url = config.get("url")
         query = config.get("query")
-        if not url or not query:
-            raise HTTPException(status_code=400, detail="warehouse jobs require url and query in source_config")
+        secret_arn = config.get("secretArn")
+        parameter_name = config.get("parameterName")
+        secret_field = config.get("secretField")
+        if not query:
+            raise HTTPException(status_code=400, detail="warehouse jobs require query in source_config")
+        provided_connections = [value for value in [url, secret_arn, parameter_name] if value]
+        if not provided_connections:
+            raise HTTPException(status_code=400, detail="warehouse jobs require a connection reference (url, secretArn, or parameterName)")
+        if len(provided_connections) > 1:
+            raise HTTPException(status_code=400, detail="warehouse jobs must specify only one connection reference")
         source = {
             "type": "warehouse",
             "warehouseType": warehouse_type,
-            "url": url,
             "query": query,
             "params": config.get("params"),
             "filename": config.get("filename"),
             "format": config.get("format", "csv"),
         }
+        if url:
+            source["url"] = url
+        if secret_arn:
+            source["secretArn"] = secret_arn
+        if parameter_name:
+            source["parameterName"] = parameter_name
+        if secret_field:
+            source["secretField"] = secret_field
         return _clean_config(source), None
 
     raise HTTPException(status_code=400, detail="Unsupported source_type")
