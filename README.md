@@ -11,6 +11,27 @@ ZIP, TAR, and TAR.GZ archives are unpacked on the fly so that nested datasets
 are normalised without additional user effort. These capabilities ensure the
 platform accepts virtually any structured dataset for downstream analytics.
 
+### Connector landscape
+
+Jobs are no longer limited to ad-hoc uploads or pre-existing S3 objects. The
+ingestion API accepts rich connector metadata via the `source_config` request
+field, enabling teams to declaratively pull data from almost any system:
+
+* **Upload:** generate a presigned URL for direct browser uploads into the
+  artifacts bucket.
+* **S3:** hydrate jobs from objects that already exist in S3 via their URI.
+* **HTTP/S endpoints:** stream payloads from REST endpoints with custom methods,
+  headers, and request bodies before staging them in S3.
+* **Databases:** execute SQL queries against JDBC/SQLAlchemy compatible
+  databases (including SQLite for local extracts) and persist the result set as
+  CSV or JSONL.
+* **Warehouses:** target Snowflake, Redshift, BigQuery, or Databricks using the
+  same SQL workflow, producing staged artifacts tagged with warehouse metadata
+  for downstream observability.
+
+This connector catalogue underpins the platform's "any dataset" promise while
+keeping the job orchestration API consistent for every source type.
+
 ## API hardening & observability
 
 The FastAPI service that fronts the ingestion workflow now exposes endpoints
