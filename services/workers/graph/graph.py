@@ -33,6 +33,30 @@ _MAX_PREVIEW_ROWS = 5
 _MAX_SAMPLE_VALUES = 5
 _MAX_DISTINCT_TRACK = 25
 _MAX_NUMERIC_ROW_SAMPLES = 500
+_MAX_HISTOGRAMS = 8
+_MAX_SCATTERS = 3
+
+
+_MATPLOTLIB_SETUP = False
+_PYLAB: Any = None
+
+
+def _get_pyplot():
+    global _MATPLOTLIB_SETUP, _PYLAB
+    if _PYLAB is not None:
+        return _PYLAB
+    try:
+        import matplotlib  # type: ignore
+
+        if not _MATPLOTLIB_SETUP:
+            matplotlib.use("Agg")
+            _MATPLOTLIB_SETUP = True
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:
+        return None
+
+    _PYLAB = plt
+    return plt
 
 
 @dataclass
@@ -710,6 +734,135 @@ def _compute_correlations(samples: Sequence[Mapping[str, float]]) -> List[Dict[s
     return correlations[:20]
 
 
+def _sanitize_filename(name: str) -> str:
+    sanitized = [
+        ch if ch.isalnum() or ch in {"-", "_"} else "_"
+        for ch in name
+    ]
+    collapsed = "".join(sanitized).strip("_")
+    return collapsed or "column"
+
+
+def _histogram_bin_count(samples: Sequence[float]) -> int:
+    unique = len(set(samples))
+    if unique <= 1:
+        return 1
+    return max(5, min(30, int(math.sqrt(len(samples)))))
+
+
+def _render_histogram(column: ColumnAccumulator) -> Optional[bytes]:
+    stats = column.numeric_stats
+    if not stats or len(stats.samples) < 2:
+        return None
+
+    plt = _get_pyplot()
+    if plt is None:
+        return None
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    bins = _histogram_bin_count(stats.samples)
+    ax.hist(
+        stats.samples,
+        bins=bins,
+        color="#2563eb",
+        edgecolor="white",
+        alpha=0.85,
+    )
+    ax.set_title(f"Distribution of {column.name}")
+    ax.set_xlabel(column.name)
+    ax.set_ylabel("Frequency")
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+    fig.tight_layout()
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=150)
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _render_scatter(
+    samples: Sequence[Mapping[str, float]], left: str, right: str
+) -> Optional[bytes]:
+    plt = _get_pyplot()
+    if plt is None:
+        return None
+
+    xs: List[float] = []
+    ys: List[float] = []
+    for row in samples:
+        if left in row and right in row:
+            xs.append(row[left])
+            ys.append(row[right])
+    if len(xs) < 2:
+        return None
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.scatter(xs, ys, s=24, alpha=0.75, c="#7c3aed", edgecolors="none")
+    ax.set_title(f"{left} vs {right}")
+    ax.set_xlabel(left)
+    ax.set_ylabel(right)
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
+    fig.tight_layout()
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=150)
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _generate_visualization_artifacts(
+    dataset: DatasetSummary, correlations: Sequence[Mapping[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
+    artifacts: Dict[str, Dict[str, Any]] = {}
+    if _get_pyplot() is None:
+        return artifacts
+
+    numeric_columns: List[ColumnAccumulator] = []
+    for name in dataset.column_names:
+        column = dataset.column(name)
+        if column.numeric_stats and column.numeric_stats.samples:
+            numeric_columns.append(column)
+
+    numeric_columns.sort(
+        key=lambda col: col.numeric_stats.count if col.numeric_stats else 0,
+        reverse=True,
+    )
+
+    for column in numeric_columns[:_MAX_HISTOGRAMS]:
+        rendered = _render_histogram(column)
+        if not rendered:
+            continue
+        slug = _sanitize_filename(column.name)
+        artifacts[f"results/graphs/{slug}_histogram.png"] = {
+            "kind": "image",
+            "data": rendered,
+            "description": f"Histogram showing the distribution of {column.name} values.",
+            "contentType": "image/png",
+        }
+
+    for corr in list(correlations)[:_MAX_SCATTERS]:
+        left = corr.get("left")
+        right = corr.get("right")
+        if not isinstance(left, str) or not isinstance(right, str):
+            continue
+        rendered = _render_scatter(dataset.numeric_row_samples, left, right)
+        if not rendered:
+            continue
+        slug = _sanitize_filename(f"{left}_vs_{right}")
+        artifacts[f"results/graphs/{slug}_scatter.png"] = {
+            "kind": "image",
+            "data": rendered,
+            "description": (
+                f"Scatter plot illustrating the relationship between {left} and {right}."
+            ),
+            "contentType": "image/png",
+        }
+
+    return artifacts
+
+
 def descriptive_stats_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
     dataset: DatasetSummary = state["dataset"]
     stats_rows: List[Dict[str, Any]] = []
@@ -780,6 +933,9 @@ def descriptive_stats_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
             "description": "Detected outliers per column using a z-score heuristic.",
             "contentType": "application/json",
         }
+
+    visualization_artifacts = _generate_visualization_artifacts(dataset, correlations)
+    artifact_contents.update(visualization_artifacts)
 
     update = _with_phase(state, "descriptive_stats", payload, artifact_contents=artifact_contents)
     _emit_callback(state, "descriptive_stats", payload)
