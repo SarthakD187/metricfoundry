@@ -65,6 +65,8 @@ _MAX_NUMERIC_ROW_SAMPLES = 500
 _MAX_AUTOML_ROWS = 2000
 _MAX_HISTOGRAMS = 8
 _MAX_SCATTERS = 3
+_MAX_BOX_PLOTS = 8
+_MAX_HEATMAP_COLUMNS = 10
 
 _DELIMITED_STREAM_CHUNK_SIZE = 64 * 1024
 _ARCHIVE_STREAM_CHUNK_SIZE = 4 * 1024 * 1024
@@ -1225,6 +1227,147 @@ def _render_scatter(
     return buffer.getvalue()
 
 
+def _compute_correlation_matrix(
+    samples: Sequence[Mapping[str, float]], column_names: Sequence[str]
+) -> Optional[List[List[float]]]:
+    column_list = list(column_names)
+    count_columns = len(column_list)
+    if count_columns < 2:
+        return None
+
+    stats: Dict[Tuple[int, int], Dict[str, float]] = {}
+    for row in samples:
+        if not row:
+            continue
+        values: List[Tuple[int, float]] = []
+        for idx, name in enumerate(column_list):
+            value = row.get(name)
+            if value is None:
+                continue
+            values.append((idx, float(value)))
+        for left_idx in range(len(values)):
+            i, x_val = values[left_idx]
+            for right_idx in range(left_idx + 1, len(values)):
+                j, y_val = values[right_idx]
+                key = (min(i, j), max(i, j))
+                agg = stats.setdefault(
+                    key,
+                    {
+                        "count": 0.0,
+                        "sum_x": 0.0,
+                        "sum_y": 0.0,
+                        "sum_x2": 0.0,
+                        "sum_y2": 0.0,
+                        "sum_xy": 0.0,
+                    },
+                )
+                agg["count"] += 1.0
+                agg["sum_x"] += x_val
+                agg["sum_y"] += y_val
+                agg["sum_x2"] += x_val * x_val
+                agg["sum_y2"] += y_val * y_val
+                agg["sum_xy"] += x_val * y_val
+
+    matrix: List[List[float]] = [
+        [float("nan") for _ in range(count_columns)]
+        for _ in range(count_columns)
+    ]
+    for idx in range(count_columns):
+        matrix[idx][idx] = 1.0
+
+    has_value = False
+    for (i, j), agg in stats.items():
+        count = agg["count"]
+        if count < 2:
+            continue
+        numerator = count * agg["sum_xy"] - agg["sum_x"] * agg["sum_y"]
+        denom_left = count * agg["sum_x2"] - agg["sum_x"] ** 2
+        denom_right = count * agg["sum_y2"] - agg["sum_y"] ** 2
+        denominator = math.sqrt(denom_left * denom_right)
+        if denominator == 0:
+            continue
+        correlation = numerator / denominator
+        matrix[i][j] = correlation
+        matrix[j][i] = correlation
+        has_value = True
+
+    if not has_value:
+        return None
+
+    return matrix
+
+
+def _render_correlation_heatmap(
+    samples: Sequence[Mapping[str, float]], column_names: Sequence[str]
+) -> Optional[bytes]:
+    plt = _get_pyplot()
+    if plt is None:
+        return None
+
+    matrix = _compute_correlation_matrix(samples, column_names)
+    if matrix is None:
+        return None
+
+    labels = list(column_names)
+    fig_size = max(6, min(12, 0.75 * len(labels)))
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+    heatmap = ax.imshow(matrix, cmap="coolwarm", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels)
+    ax.set_title("Correlation Heatmap")
+    fig.colorbar(heatmap, ax=ax, fraction=0.046, pad=0.04, label="Correlation")
+    fig.tight_layout()
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=150)
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _render_box_plots(columns: Sequence[ColumnAccumulator]) -> Optional[bytes]:
+    plt = _get_pyplot()
+    if plt is None:
+        return None
+
+    data: List[Sequence[float]] = []
+    labels: List[str] = []
+    for column in columns:
+        stats = column.numeric_stats
+        if not stats or len(stats.samples) < 2:
+            continue
+        data.append(stats.samples)
+        labels.append(column.name)
+
+    if not data:
+        return None
+
+    width = max(6, min(12, 1.2 * len(data)))
+    fig, ax = plt.subplots(figsize=(width, 4.5))
+    box = ax.boxplot(
+        data,
+        labels=labels,
+        patch_artist=True,
+        vert=True,
+    )
+    for patch in box["boxes"]:
+        patch.set(facecolor="#22c55e", alpha=0.6)
+    for median in box["medians"]:
+        median.set(color="#0f172a", linewidth=1.5)
+    ax.set_title("Box Plot Distribution by Column")
+    ax.set_ylabel("Value")
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+    fig.tight_layout()
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=150)
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def _generate_visualization_artifacts(
     dataset: DatasetSummary, correlations: Sequence[Mapping[str, Any]]
 ) -> Dict[str, Dict[str, Any]]:
@@ -1270,6 +1413,27 @@ def _generate_visualization_artifacts(
             "description": (
                 f"Scatter plot illustrating the relationship between {left} and {right}."
             ),
+            "contentType": "image/png",
+        }
+
+    box_plot_rendered = _render_box_plots(numeric_columns[:_MAX_BOX_PLOTS])
+    if box_plot_rendered:
+        artifacts["results/graphs/box_plots.png"] = {
+            "kind": "image",
+            "data": box_plot_rendered,
+            "description": "Box plots summarizing the distribution and spread of numeric columns.",
+            "contentType": "image/png",
+        }
+
+    heatmap_columns = [col.name for col in numeric_columns[:_MAX_HEATMAP_COLUMNS]]
+    heatmap_rendered = _render_correlation_heatmap(
+        dataset.numeric_row_samples, heatmap_columns
+    )
+    if heatmap_rendered:
+        artifacts["results/graphs/correlation_heatmap.png"] = {
+            "kind": "image",
+            "data": heatmap_rendered,
+            "description": "Heatmap visualizing pairwise correlations between numeric columns.",
             "contentType": "image/png",
         }
 
