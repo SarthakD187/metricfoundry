@@ -195,6 +195,7 @@ def test_pipeline_ingests_diverse_formats(key, body, expected_format):
     contents_keys = result.artifact_contents.keys()
     assert "results/descriptive_stats.csv" in contents_keys
     assert "results/report.txt" in contents_keys
+    assert "results/report.html" in contents_keys
     assert "results/bundles/analytics_bundle.zip" in contents_keys
     assert "phases/phase_payloads.zip" in contents_keys
 
@@ -204,6 +205,9 @@ def test_pipeline_ingests_diverse_formats(key, body, expected_format):
 
     summary = result.phases["nl_report"]["summary"]
     assert f"{len(SAMPLE_ROWS)} rows" in summary
+    report_artifacts = result.phases["nl_report"].get("reportArtifacts", {})
+    assert report_artifacts.get("html") == "results/report.html"
+    assert report_artifacts.get("text") == "results/report.txt"
 
 
 def test_pipeline_streams_delimited_input_without_full_decode():
