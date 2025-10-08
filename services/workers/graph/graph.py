@@ -16,6 +16,7 @@ import sqlite3
 import tarfile
 import tempfile
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import (
     IO,
@@ -421,6 +422,9 @@ class _AutoMLArtifacts:
     prediction_headers: Optional[List[str]] = None
     prediction_rows: Optional[List[Dict[str, Any]]] = None
     model_bytes: Optional[bytes] = None
+    prediction_artifact_path: Optional[str] = None
+    prediction_artifact_description: Optional[str] = None
+    extra_artifacts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 def _format_preview(value: Any) -> Any:
@@ -1489,6 +1493,7 @@ def _run_automl_training(dataset: DatasetSummary) -> _AutoMLArtifacts:
         )
 
     try:
+        from sklearn.cluster import KMeans  # type: ignore
         from sklearn.compose import ColumnTransformer  # type: ignore
         from sklearn.ensemble import (  # type: ignore
             GradientBoostingClassifier,
@@ -1504,6 +1509,7 @@ def _run_automl_training(dataset: DatasetSummary) -> _AutoMLArtifacts:
             mean_absolute_error,
             mean_squared_error,
             r2_score,
+            silhouette_score,
         )
         from sklearn.model_selection import train_test_split  # type: ignore
         from sklearn.pipeline import Pipeline as SKPipeline  # type: ignore
@@ -1601,12 +1607,253 @@ def _run_automl_training(dataset: DatasetSummary) -> _AutoMLArtifacts:
         elif fallback is not None:
             target_column = fallback
 
+    warnings_out: List[str] = []
+
     if target_column is None:
-        return _AutoMLArtifacts(
-            payload={
-                "status": "skipped",
-                "message": "A suitable target column could not be inferred for automated modeling.",
+        feature_columns = [col for col in frame.columns if frame[col].notnull().sum() > 0]
+        if not feature_columns:
+            return _AutoMLArtifacts(
+                payload={
+                    "status": "skipped",
+                    "message": "Clustering requires at least one informative feature column.",
+                }
+            )
+
+        X = frame[feature_columns].copy()
+        feature_mask = X.notnull().sum(axis=1) > 0
+        X = X.loc[feature_mask]
+        if len(X) < 10:
+            return _AutoMLArtifacts(
+                payload={
+                    "status": "skipped",
+                    "message": "At least 10 rows with usable features are required for clustering previews.",
+                }
+            )
+
+        for col in X.columns:
+            series = X[col]
+            if pdt.is_bool_dtype(series):
+                X[col] = series.astype(int)
+                continue
+            if pdt.is_object_dtype(series):
+                numeric_candidate = pd.to_numeric(series, errors="coerce")
+                if numeric_candidate.notnull().sum() >= max(3, int(0.6 * series.notnull().sum())):
+                    X[col] = numeric_candidate
+                else:
+                    X[col] = series.astype(str)
+
+        constant_columns = [col for col in X.columns if X[col].nunique(dropna=True) <= 1]
+        if constant_columns:
+            X = X.drop(columns=constant_columns)
+            feature_columns = [col for col in feature_columns if col not in constant_columns]
+        if X.empty or not feature_columns:
+            return _AutoMLArtifacts(
+                payload={
+                    "status": "skipped",
+                    "message": "Clustering requires at least one informative feature column.",
+                }
+            )
+
+        numeric_features = [col for col in X.columns if pdt.is_numeric_dtype(X[col])]
+        categorical_features = [col for col in X.columns if col not in numeric_features]
+        if not numeric_features and not categorical_features:
+            return _AutoMLArtifacts(
+                payload={
+                    "status": "skipped",
+                    "message": "Clustering requires at least one informative feature column.",
+                }
+            )
+
+        def _make_preprocessor() -> ColumnTransformer:
+            transformers = []
+            if numeric_features:
+                transformers.append(
+                    (
+                        "numeric",
+                        SKPipeline(
+                            steps=[
+                                ("imputer", SimpleImputer(strategy="median")),
+                                ("scaler", StandardScaler()),
+                            ]
+                        ),
+                        numeric_features,
+                    )
+                )
+            if categorical_features:
+                try:
+                    encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+                except TypeError:  # pragma: no cover - older sklearn fallback
+                    encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
+                transformers.append(
+                    (
+                        "categorical",
+                        SKPipeline(
+                            steps=[
+                                ("imputer", SimpleImputer(strategy="most_frequent")),
+                                ("encoder", encoder),
+                            ]
+                        ),
+                        categorical_features,
+                    )
+                )
+            return ColumnTransformer(transformers=transformers, remainder="drop")
+
+        try:
+            preprocessor = _make_preprocessor()
+            processed = preprocessor.fit_transform(X)
+        except Exception as exc:
+            return _AutoMLArtifacts(
+                payload={
+                    "status": "failed",
+                    "message": "Failed to prepare features for clustering.",
+                    "details": str(exc),
+                }
+            )
+
+        if hasattr(processed, "toarray"):
+            processed_array = processed.toarray()
+        else:
+            processed_array = processed
+
+        max_clusters = min(6, len(X) - 1)
+        if max_clusters < 2:
+            return _AutoMLArtifacts(
+                payload={
+                    "status": "skipped",
+                    "message": "Clustering requires at least two clusters and sufficient rows to evaluate them.",
+                }
+            )
+
+        candidate_summaries: List[Dict[str, Any]] = []
+        silhouette_scores_map: Dict[int, float] = {}
+        best_labels: Optional[Any] = None
+        best_k: Optional[int] = None
+        best_score: float = float("-inf")
+
+        for n_clusters in range(2, max_clusters + 1):
+            model_name = f"kmeans_{n_clusters}"
+            try:
+                model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+                labels = model.fit_predict(processed_array)
+                if len(set(int(label) for label in labels)) < 2:
+                    candidate_summaries.append(
+                        {
+                            "name": model_name,
+                            "status": "degenerate",
+                            "clusterCount": n_clusters,
+                        }
+                    )
+                    warnings_out.append(f"{model_name}: produced a single cluster")
+                    continue
+                score = float(silhouette_score(processed_array, labels))
+                silhouette_scores_map[n_clusters] = score
+                candidate_summaries.append(
+                    {
+                        "name": model_name,
+                        "status": "evaluated",
+                        "clusterCount": n_clusters,
+                        "silhouetteScore": score,
+                    }
+                )
+                if score > best_score:
+                    best_score = score
+                    best_labels = labels
+                    best_k = n_clusters
+            except Exception as exc:
+                warnings_out.append(f"{model_name}: {exc}")
+                candidate_summaries.append(
+                    {
+                        "name": model_name,
+                        "status": "error",
+                        "clusterCount": n_clusters,
+                        "message": str(exc),
+                    }
+                )
+
+        if best_labels is None or best_k is None:
+            return _AutoMLArtifacts(
+                payload={
+                    "status": "failed",
+                    "message": "All clustering attempts failed.",
+                    "warnings": warnings_out,
+                    "candidateModels": candidate_summaries,
+                }
+            )
+
+        cluster_sizes = Counter(int(label) for label in best_labels)
+        cluster_summary = [
+            {"cluster": int(cluster), "size": int(size)}
+            for cluster, size in sorted(cluster_sizes.items(), key=lambda item: item[0])
+        ]
+
+        assignments = [
+            {"rowId": int(idx), "cluster": int(label)}
+            for idx, label in enumerate(best_labels)
+        ]
+
+        feature_stats: List[Dict[str, Any]] = []
+        for col in X.columns:
+            non_null = int(X[col].notnull().sum())
+            coverage = float(non_null / len(X)) if len(X) else 0.0
+            unique = int(X[col].nunique(dropna=True))
+            feature_stats.append(
+                {
+                    "name": col,
+                    "nonNullCount": non_null,
+                    "coverage": coverage,
+                    "uniqueValues": unique,
+                }
+            )
+
+        payload = {
+            "status": "succeeded",
+            "message": "Automated clustering preview completed successfully.",
+            "mode": "clustering",
+            "rowsUsed": len(X),
+            "featureColumns": list(X.columns),
+            "bestModel": {
+                "name": f"kmeans_{best_k}",
+                "metric": "silhouette",
+                "score": best_score,
+                "clusterCount": best_k,
+            },
+            "candidateModels": candidate_summaries,
+            "clusterSummary": cluster_summary,
+            "silhouetteScores": {
+                int(k): float(v) for k, v in silhouette_scores_map.items()
+            },
+            "featureStats": feature_stats,
+            "predictionPreview": assignments[:10],
+            "artifacts": {
+                "clusters": "results/clusters.csv",
+                "clusterMetrics": "results/clustering_metrics.json",
+            },
+        }
+        if warnings_out:
+            payload["warnings"] = warnings_out
+
+        extra_artifacts = {
+            "results/clustering_metrics.json": {
+                "kind": "json",
+                "data": {
+                    "best": {
+                        "clusterCount": best_k,
+                        "silhouetteScore": best_score,
+                    },
+                    "candidates": candidate_summaries,
+                },
+                "description": "Silhouette scores for candidate clustering solutions.",
+                "contentType": "application/json",
             }
+        }
+
+        return _AutoMLArtifacts(
+            payload=payload,
+            prediction_headers=["rowId", "cluster"],
+            prediction_rows=assignments,
+            prediction_artifact_path="results/clusters.csv",
+            prediction_artifact_description="Cluster assignments produced by the automated clustering preview.",
+            extra_artifacts=extra_artifacts,
         )
 
     feature_columns = [col for col in frame.columns if col != target_column]
@@ -1770,7 +2017,7 @@ def _run_automl_training(dataset: DatasetSummary) -> _AutoMLArtifacts:
         ]
 
     candidate_summaries: List[Dict[str, Any]] = []
-    warnings_out: List[str] = []
+    warnings_out = []
     best_pipeline: Optional[SKPipeline] = None
     best_model_name: Optional[str] = None
     best_metrics: Dict[str, Any] = {}
@@ -1941,6 +2188,8 @@ def _run_automl_training(dataset: DatasetSummary) -> _AutoMLArtifacts:
         prediction_headers=prediction_headers,
         prediction_rows=prediction_rows,
         model_bytes=model_bytes,
+        prediction_artifact_path="results/predictions.csv",
+        prediction_artifact_description="Predictions generated by the automated model selection pipeline.",
     )
 
 
@@ -2041,12 +2290,22 @@ def ml_inference_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
 
     payload = dict(automl_result.payload)
 
+    if automl_result.extra_artifacts:
+        artifact_contents.update(automl_result.extra_artifacts)
+
     if automl_result.prediction_headers and automl_result.prediction_rows is not None:
-        artifact_contents["results/predictions.csv"] = {
+        artifact_path = (
+            automl_result.prediction_artifact_path or "results/predictions.csv"
+        )
+        artifact_description = (
+            automl_result.prediction_artifact_description
+            or "Predictions generated by the automated model selection pipeline."
+        )
+        artifact_contents[artifact_path] = {
             "kind": "csv",
             "headers": automl_result.prediction_headers,
             "rows": automl_result.prediction_rows,
-            "description": "Predictions generated by the automated model selection pipeline.",
+            "description": artifact_description,
             "contentType": "text/csv",
         }
 
