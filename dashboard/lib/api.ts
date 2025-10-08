@@ -30,9 +30,25 @@ export interface ArtifactListResponse {
   nextToken?: string | null;
 }
 
+export interface ManifestArtifactEntry {
+  name?: string;
+  description?: string;
+  contentType?: string;
+  key: string;
+  [key: string]: unknown;
+}
+
+export interface ManifestPayload {
+  jobId?: string;
+  basePath?: string;
+  artifacts?: ManifestArtifactEntry[];
+  dataQuality?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
 export interface ManifestResponse {
   jobId: string;
-  manifest: unknown;
+  manifest: ManifestPayload;
   etag?: string;
   contentLength?: number;
 }

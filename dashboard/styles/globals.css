@@ -391,15 +391,122 @@ button.secondary {
 .manifest-viewer {
   background: rgba(15, 23, 42, 0.05);
   border-radius: 16px;
-  padding: 1rem;
-  max-height: 320px;
-  overflow: auto;
+  padding: 1.5rem;
 }
 
-.manifest-viewer pre {
+.manifest-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.manifest-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+.manifest-summary h3 {
+  margin: 0.1rem 0 0;
+}
+
+.artifact-preview-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.artifact-preview-card {
+  background: rgba(255, 255, 255, 0.5);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 12px;
+  padding: 1rem 1.25rem;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+}
+
+.artifact-preview-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.artifact-preview-card h4 {
   margin: 0;
+  font-size: 1.05rem;
+}
+
+.artifact-preview-description,
+.artifact-preview-path {
+  margin: 0.25rem 0 0;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.artifact-preview-path {
+  font-family: 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', ui-monospace, monospace;
+  font-size: 0.8rem;
+  opacity: 0.8;
+}
+
+.artifact-preview-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.5rem;
+  min-width: 140px;
+}
+
+.artifact-preview-meta {
+  font-size: 0.85rem;
+  color: rgba(15, 23, 42, 0.6);
+}
+
+.artifact-preview-body {
+  margin-top: 1rem;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.04);
+  padding: 1rem;
+  overflow-x: auto;
+}
+
+.artifact-preview-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.artifact-preview-table th,
+.artifact-preview-table td {
+  border-bottom: 1px solid rgba(15, 23, 42, 0.08);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+}
+
+.artifact-preview-table tbody tr:last-child th,
+.artifact-preview-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.artifact-preview-image {
+  max-width: 100%;
+  border-radius: 10px;
+  display: block;
+}
+
+.artifact-preview-text {
+  margin: 0;
+  white-space: pre-wrap;
   font-family: 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', ui-monospace, monospace;
   font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.artifact-preview-unsupported {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--text-secondary);
 }
 
 .artifact-section {
