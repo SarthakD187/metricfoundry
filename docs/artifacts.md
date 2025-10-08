@@ -19,6 +19,7 @@ artifacts/<jobId>/
     ├── descriptive_stats.csv
     ├── manifest.json
     ├── outliers.json
+    ├── report.html
     ├── report.txt
     ├── results.json
     └── bundles/
@@ -44,6 +45,7 @@ phases:
 - `correlations.csv` – pairwise Pearson correlations derived from numeric
   samples.
 - `outliers.json` – detected outliers for numeric fields along with z-scores.
+- `report.html` – shareable HTML narrative combining key metrics and insights.
 - `report.txt` – natural-language summary for quick operator review.
 - `graphs/` – PNG visualizations such as histograms and scatter plots for quick exploration of numeric fields.
 - `bundles/analytics_bundle.zip` – curated download that groups descriptive

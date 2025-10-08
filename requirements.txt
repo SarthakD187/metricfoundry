@@ -14,6 +14,7 @@ httpx==0.28.1
 idna==3.10
 jiter==0.11.0
 jmespath==1.0.1
+Jinja2==3.1.4
 jsonpatch==1.33
 jsonpointer==3.0.0
 langchain==0.3.27

@@ -6,8 +6,10 @@ import codecs
 import contextlib
 import csv
 import gzip
+import html
 import io
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -31,6 +33,14 @@ from typing import (
     Union,
     cast,
 )
+from pathlib import Path
+
+try:  # pragma: no cover - optional dependency for HTML reporting
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+except ModuleNotFoundError:  # pragma: no cover - fallback when Jinja2 is unavailable
+    Environment = None  # type: ignore[assignment]
+    FileSystemLoader = None  # type: ignore[assignment]
+    select_autoescape = None  # type: ignore[assignment]
 
 from langgraph.graph import END, StateGraph
 
@@ -45,6 +55,18 @@ PHASE_ORDER = [
 ]
 
 PhaseCallback = Callable[[str, Mapping[str, Any], int, int], None]
+
+logger = logging.getLogger(__name__)
+
+_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+_NL_REPORT_TEMPLATE_NAME = "nl_report.html.j2"
+if Environment is not None and FileSystemLoader is not None and select_autoescape is not None:
+    _JINJA_ENV = Environment(
+        loader=FileSystemLoader(str(_TEMPLATE_DIR)),
+        autoescape=select_autoescape(["html", "xml"]),
+    )
+else:  # pragma: no cover - executed in environments without Jinja2 installed
+    _JINJA_ENV = None
 
 _NULL_SENTINELS = {"", "null", "NULL", "NaN", "nan"}
 _MAX_PREVIEW_ROWS = 5
@@ -736,6 +758,11 @@ def _artifact_bytes_for_bundle(spec: Mapping[str, Any]) -> Optional[bytes]:
         for row in rows:
             writer.writerow({header: row.get(header, "") for header in headers})
         return output.getvalue().encode("utf-8")
+    if kind == "html":
+        html_text = spec.get("html") or spec.get("text") or ""
+        if not isinstance(html_text, str):
+            html_text = str(html_text)
+        return html_text.encode("utf-8")
     if kind in {"image", "binary"}:
         data = spec.get("data", b"")
         if isinstance(data, memoryview):  # pragma: no cover - defensive conversion
@@ -2072,9 +2099,73 @@ def nl_report_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
     summary_lines.append("Further modeling pipelines can build on these profiling insights.")
     summary_text = " ".join(summary_lines)
 
+    dq_issues = []
+    for issue in list(dq.get("issues", []))[:20]:
+        dq_issues.append(
+            {
+                "rule": issue.get("rule"),
+                "column": issue.get("column"),
+                "message": issue.get("message"),
+                "severity": issue.get("severity"),
+            }
+        )
+
+    dq_context = {
+        "score": dq_score,
+        "severity_summary": dict(dq.get("severitySummary", {})) or None,
+        "issues": dq_issues,
+    }
+
+    correlation_preview = [
+        {
+            "left": item.get("left"),
+            "right": item.get("right"),
+            "correlation": item.get("correlation", 0.0),
+        }
+        for item in correlations[:10]
+    ]
+
+    outlier_preview: List[Dict[str, Any]] = []
+    for entry in outliers[:5]:
+        values = [
+            {
+                "value": value.get("value"),
+                "zscore": value.get("zscore"),
+            }
+            for value in entry.get("values", [])[:5]
+        ]
+        outlier_preview.append(
+            {
+                "column": entry.get("column"),
+                "values": values,
+            }
+        )
+
+    html_context = {
+        "summary_text": summary_text,
+        "highlights": highlights,
+        "dataset": {"row_text": row_text, "column_text": column_text},
+        "dq": dq_context,
+        "correlations": correlation_preview,
+        "outliers": outlier_preview,
+    }
+
+    escaped_summary = html.escape(summary_text)
+    html_report = f"<html><body><p>{escaped_summary}</p></body></html>"
+    if _JINJA_ENV is not None:
+        try:
+            template = _JINJA_ENV.get_template(_NL_REPORT_TEMPLATE_NAME)
+            html_report = template.render(html_context)
+        except Exception:
+            logger.exception("failed to render HTML narrative report")
+
     payload = {
         "summary": summary_text,
         "highlights": highlights,
+        "reportArtifacts": {
+            "text": "results/report.txt",
+            "html": "results/report.html",
+        },
     }
 
     artifact_contents = dict(state.get("artifact_contents", {}))
@@ -2083,6 +2174,12 @@ def nl_report_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
         "text": summary_text,
         "description": "Natural language narrative summarizing the dataset.",
         "contentType": "text/plain",
+    }
+    artifact_contents["results/report.html"] = {
+        "kind": "html",
+        "html": html_report,
+        "description": "Formatted HTML narrative summarizing the dataset.",
+        "contentType": "text/html",
     }
 
     update = _with_phase(state, "nl_report", payload, artifact_contents=artifact_contents)

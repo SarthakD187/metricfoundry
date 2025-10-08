@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>MetricFoundry Narrative Report</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --mf-background: #ffffff;
+        --mf-foreground: #1f2933;
+        --mf-muted: #4a5568;
+        --mf-border: #d1d5db;
+        --mf-accent: #2563eb;
+        font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+      }
+
+      body {
+        margin: 0;
+        padding: 2rem;
+        background: var(--mf-background);
+        color: var(--mf-foreground);
+        line-height: 1.6;
+        font-size: 16px;
+      }
+
+      header {
+        border-bottom: 1px solid var(--mf-border);
+        margin-bottom: 1.5rem;
+        padding-bottom: 1rem;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 1.875rem;
+      }
+
+      h2 {
+        font-size: 1.25rem;
+        margin-top: 2rem;
+        margin-bottom: 0.5rem;
+        color: var(--mf-muted);
+      }
+
+      section {
+        margin-bottom: 1.5rem;
+      }
+
+      ul {
+        padding-left: 1.25rem;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 0.75rem;
+      }
+
+      th,
+      td {
+        text-align: left;
+        padding: 0.5rem;
+        border-bottom: 1px solid var(--mf-border);
+        vertical-align: top;
+      }
+
+      th {
+        font-weight: 600;
+        background-color: rgba(37, 99, 235, 0.08);
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.15rem 0.5rem;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+      }
+
+      .pill.ERROR {
+        background-color: rgba(220, 38, 38, 0.15);
+        color: #b91c1c;
+      }
+
+      .pill.WARNING {
+        background-color: rgba(217, 119, 6, 0.15);
+        color: #b45309;
+      }
+
+      .pill.INFO {
+        background-color: rgba(59, 130, 246, 0.15);
+        color: #1d4ed8;
+      }
+
+      footer {
+        margin-top: 2rem;
+        font-size: 0.9rem;
+        color: var(--mf-muted);
+      }
+
+      .data-points {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1rem;
+        margin-top: 1rem;
+      }
+
+      .data-point {
+        border: 1px solid var(--mf-border);
+        border-radius: 0.5rem;
+        padding: 0.75rem 1rem;
+        flex: 1 1 180px;
+      }
+
+      .data-point dt {
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--mf-muted);
+        margin-bottom: 0.25rem;
+      }
+
+      .data-point dd {
+        margin: 0;
+        font-size: 1.25rem;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>MetricFoundry Narrative Report</h1>
+      <p>{{ summary_text }}</p>
+    </header>
+
+    <section>
+      <h2>Dataset Overview</h2>
+      <div class="data-points">
+        <dl class="data-point">
+          <dt>Rows analysed</dt>
+          <dd>{{ dataset.row_text }}</dd>
+        </dl>
+        <dl class="data-point">
+          <dt>Columns profiled</dt>
+          <dd>{{ dataset.column_text }}</dd>
+        </dl>
+        <dl class="data-point">
+          <dt>Data quality</dt>
+          <dd>
+            {% if dq.score is not none %}
+              {{ (dq.score * 100) | round(1) }}%
+            {% else %}
+              Checks executed
+            {% endif %}
+          </dd>
+        </dl>
+      </div>
+    </section>
+
+    {% if highlights %}
+      <section>
+        <h2>Key Highlights</h2>
+        <ul>
+          {% for highlight in highlights %}
+            <li>{{ highlight }}</li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+
+    <section>
+      <h2>Data Quality Insights</h2>
+      {% if dq.severity_summary %}
+        <div class="data-points">
+          {% for severity, count in dq.severity_summary.items() %}
+            <dl class="data-point">
+              <dt>{{ severity.title() }} issues</dt>
+              <dd>{{ count }}</dd>
+            </dl>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      {% if dq.issues %}
+        <table>
+          <thead>
+            <tr>
+              <th>Rule</th>
+              <th>Column</th>
+              <th>Message</th>
+              <th>Severity</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for issue in dq.issues %}
+              <tr>
+                <td>{{ issue.rule }}</td>
+                <td>{{ issue.column or "—" }}</td>
+                <td>{{ issue.message }}</td>
+                <td><span class="pill {{ issue.severity }}">{{ issue.severity }}</span></td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p>No data quality issues were detected for the profiled dataset.</p>
+      {% endif %}
+    </section>
+
+    {% if correlations %}
+      <section>
+        <h2>Strongest Correlations</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Left column</th>
+              <th>Right column</th>
+              <th>Correlation (r)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for corr in correlations %}
+              <tr>
+                <td>{{ corr.left }}</td>
+                <td>{{ corr.right }}</td>
+                <td>{{ corr.correlation | round(3) }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+    {% endif %}
+
+    {% if outliers %}
+      <section>
+        <h2>Potential Outliers</h2>
+        {% for outlier in outliers %}
+          <h3>{{ outlier.column }}</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Value</th>
+                <th>Z-score</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for value in outlier.values %}
+                <tr>
+                  <td>{{ value.value }}</td>
+                  <td>{{ value.zscore | round(2) }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% endfor %}
+      </section>
+    {% endif %}
+
+    <footer>Generated automatically by MetricFoundry.</footer>
+  </body>
+</html>
