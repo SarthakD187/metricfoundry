@@ -258,11 +258,47 @@ def serialize_objects(objects: Iterable[dict]) -> List[dict]:
     return serialized
 
 
+def _normalize_s3_path(value: str) -> str:
+    """Return a canonical representation of an S3 key or prefix.
+
+    S3 treats keys as POSIX-like paths.  This helper collapses ``.`` and ``..``
+    segments so callers can safely compare prefixes without being tricked by
+    directory traversal payloads like ``artifacts/{job}/../other``.
+    """
+
+    if value == "":
+        return value
+
+    segments: List[str] = []
+    for segment in value.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if segments:
+                segments.pop()
+            continue
+        segments.append(segment)
+
+    normalised = "/".join(segments)
+    if value.endswith("/") and normalised:
+        normalised += "/"
+    return normalised
+
+
 def validate_prefix(job_id: str, prefix: Optional[str], *, base: str) -> str:
     target = prefix or base
-    if not target.startswith(base):
+    base_normalised = _normalize_s3_path(base)
+    target_normalised = _normalize_s3_path(target)
+
+    base_compare = base_normalised.rstrip("/")
+    target_compare = target_normalised.rstrip("/")
+
+    if target_compare != base_compare and not target_compare.startswith(f"{base_compare}/"):
         raise HTTPException(status_code=400, detail="prefix must target this job's artifacts")
-    return target
+
+    if target_compare == base_compare:
+        return base_normalised
+    return target_normalised
 
 
 def ddb_item_to_job(job_id: str, item: dict) -> dict:
@@ -436,9 +472,10 @@ def list_job_result_files(
 @app.get("/jobs/{job_id}/results")
 def get_job_results(job_id: str, path: Optional[str] = Query(default=None, description="Relative path within the job's results directory")):
     ensure_job(job_id)
-    prefix = f"artifacts/{job_id}/results/"
+    prefix = _normalize_s3_path(f"artifacts/{job_id}/results/")
     relative = path.lstrip("/") if path else "results.json"
-    key = prefix + relative
+    prefix_no_trailing = prefix[:-1] if prefix.endswith("/") else prefix
+    key = _normalize_s3_path(f"{prefix_no_trailing}/{relative}")
 
     if not key.startswith(prefix):
         raise HTTPException(status_code=400, detail="path must resolve within the results directory")
