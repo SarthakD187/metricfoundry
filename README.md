@@ -24,14 +24,17 @@ field, enabling teams to declaratively pull data from almost any system:
   headers, and request bodies before staging them in S3.
 * **Databases:** execute SQL queries against JDBC/SQLAlchemy compatible
   databases (including SQLite for local extracts) and persist the result set as
-  CSV or JSONL. Connection strings can be provided inline _or_ referenced via
-  AWS Secrets Manager / Systems Manager Parameter Store identifiers so
-  credentials never transit the API payload.
+  CSV or JSONL. The API now persists connection metadata under a dedicated
+  `connection` object on each job. Inline URLs use `{ "type": "inline", "url": "..." }`
+  while secure deployments reference AWS Secrets Manager or Systems Manager
+  Parameter Store, for example `{ "type": "secretsManager", "secretArn": "...",
+  "secretField": "url" }`. The staging Lambda resolves these indirections at
+  runtime so credentials never transit the API payload.
 * **Warehouses:** target Snowflake, Redshift, BigQuery, or Databricks using the
   same SQL workflow, producing staged artifacts tagged with warehouse metadata
-  for downstream observability. Warehouse connectors share the same secret and
-  parameter indirection used by databases, letting teams centralise credential
-  management.
+  for downstream observability. Warehouse connectors share the same connection
+  schema, letting teams centralise credential management across both OLTP and
+  analytical systems.
 
 This connector catalogue underpins the platform's "any dataset" promise while
 keeping the job orchestration API consistent for every source type.
