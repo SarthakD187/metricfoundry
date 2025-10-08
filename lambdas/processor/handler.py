@@ -105,6 +105,12 @@ def _persist_artifact(bucket: str, key: str, spec: Mapping[str, Any]) -> None:
         headers = spec.get("headers", [])
         rows = spec.get("rows", [])
         body = _csv_bytes(list(headers), list(rows))
+    elif kind == "html":
+        html = spec.get("html", "")
+        if isinstance(html, bytes):
+            body = html
+        else:
+            body = str(html).encode("utf-8")
     elif kind == "image":
         data = spec.get("data", b"")
         if isinstance(data, memoryview):  # pragma: no cover - defensive conversion

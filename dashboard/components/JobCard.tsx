@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import ArtifactBrowser from './ArtifactBrowser';
-import { fetchManifest, fetchResultLink } from '../lib/api';
+import ManifestPreview from './ManifestPreview';
+import { fetchManifest, fetchResultLink, ManifestPayload } from '../lib/api';
 import type { TrackedJob } from '../hooks/usePersistentJobs';
 
 interface JobCardProps {
@@ -12,7 +13,7 @@ interface JobCardProps {
 export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
   const [showArtifacts, setShowArtifacts] = useState(false);
   const [showManifest, setShowManifest] = useState(false);
-  const [manifest, setManifest] = useState<unknown>(null);
+  const [manifest, setManifest] = useState<ManifestPayload | null>(null);
   const [manifestError, setManifestError] = useState<string | null>(null);
   const [manifestLoading, setManifestLoading] = useState(false);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
@@ -30,7 +31,7 @@ export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
       setManifestLoading(true);
       setManifestError(null);
       const response = await fetchManifest(job.jobId);
-      setManifest(response.manifest);
+      setManifest(response.manifest ?? null);
     } catch (error) {
       console.error('Failed to load manifest', error);
       setManifestError(error instanceof Error ? error.message : 'Unable to load manifest');
@@ -113,7 +114,7 @@ export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
           {manifestLoading && <p className="loading">Loading manifest…</p>}
           {manifestError && <div className="error-banner">{manifestError}</div>}
           {manifest && !manifestLoading && (
-            <pre>{JSON.stringify(manifest, null, 2)}</pre>
+            <ManifestPreview jobId={job.jobId} manifest={manifest} />
           )}
         </section>
       )}

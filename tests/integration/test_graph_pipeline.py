@@ -8,10 +8,11 @@ import sqlite3
 import sys
 import tempfile
 import zipfile
-from types import ModuleType
-from typing import Iterable, List
+from typing import Iterable
 
 import pytest
+
+from tests.integration.utils.langgraph import ensure_langgraph_stub
 
 
 SAMPLE_ROWS = [{"id": index, "value": index * 10} for index in range(1, 11)]
@@ -19,66 +20,6 @@ SAMPLE_ROWS = [{"id": index, "value": index * 10} for index in range(1, 11)]
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
-
-
-def _ensure_state_graph_stub() -> None:
-    try:
-        importlib.import_module("langgraph.graph")
-        return
-    except Exception:
-        pass
-
-    pkg = ModuleType("langgraph")
-    mod = ModuleType("langgraph.graph")
-
-    END = object()
-
-    class _CompiledGraph:
-        def __init__(self, nodes, order):
-            self._nodes = nodes
-            self._order = order
-
-        def invoke(self, initial_state):
-            state = dict(initial_state)
-            for name in self._order:
-                update = self._nodes[name](state)
-                if update:
-                    state.update(update)
-            return state
-
-    class StateGraph:
-        def __init__(self, _state_type):
-            self._nodes = {}
-            self._edges = {}
-            self._entry = None
-
-        def add_node(self, name, func):
-            self._nodes[name] = func
-
-        def set_entry_point(self, name):
-            self._entry = name
-
-        def add_edge(self, source, dest):
-            self._edges.setdefault(source, []).append(dest)
-
-        def compile(self):
-            order: List[str] = []
-            current = self._entry
-            visited: set[str] = set()
-            while current is not None and current != END:
-                if current in visited:
-                    raise RuntimeError("cycle detected in stub graph")
-                visited.add(current)
-                order.append(current)
-                next_nodes = self._edges.get(current, [])
-                current = next_nodes[0] if next_nodes else None
-            return _CompiledGraph(self._nodes, order)
-
-    mod.END = END
-    mod.StateGraph = StateGraph
-    pkg.graph = mod
-    sys.modules["langgraph"] = pkg
-    sys.modules["langgraph.graph"] = mod
 
 
 def _csv_bytes(rows: Iterable[dict]) -> bytes:
@@ -154,7 +95,7 @@ class _ChunkedBinaryStream:
         return True
 
 
-_ensure_state_graph_stub()
+ensure_langgraph_stub()
 module = importlib.import_module("services.workers.graph.graph")
 importlib.reload(module)
 run_pipeline = module.run_pipeline
