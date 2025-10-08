@@ -7,6 +7,7 @@ import contextlib
 import csv
 import gzip
 import html
+import mimetypes
 import io
 import json
 import logging
@@ -786,6 +787,85 @@ def _zip_bytes_for(files: Mapping[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
+def _is_visualization_artifact(relative_key: str, spec: Mapping[str, Any]) -> bool:
+    if relative_key.startswith("results/graphs/"):
+        return True
+
+    bundle_hint = spec.get("bundle")
+    if isinstance(bundle_hint, str) and bundle_hint.lower() == "visualization":
+        return True
+
+    content_type = spec.get("contentType")
+    if isinstance(content_type, str) and content_type.lower().startswith("image/"):
+        return True
+
+    kind = spec.get("kind")
+    if isinstance(kind, str) and kind.lower() == "image":
+        return True
+
+    return False
+
+
+def _guess_content_type_for_artifact(relative_key: str, spec: Mapping[str, Any]) -> str:
+    content_type = spec.get("contentType")
+    if isinstance(content_type, str) and content_type:
+        return content_type
+
+    kind = spec.get("kind")
+    if kind == "html":
+        return "text/html"
+    if kind == "text":
+        return "text/plain"
+    if kind == "json":
+        return "application/json"
+    if kind == "csv":
+        return "text/csv"
+    if kind == "image":
+        return "image/png"
+
+    guessed, _ = mimetypes.guess_type(relative_key)
+    if guessed:
+        return guessed
+
+    return "application/octet-stream"
+
+
+def _default_description_for_artifact(relative_key: str, spec: Mapping[str, Any]) -> str:
+    if _is_visualization_artifact(relative_key, spec):
+        return "Visualization asset generated during dataset analysis."
+    if relative_key.endswith(".html"):
+        return "HTML artifact generated during dataset analysis."
+    if relative_key.endswith(".txt"):
+        return "Text artifact generated during dataset analysis."
+    if relative_key.endswith(".csv"):
+        return "Tabular artifact generated during dataset analysis."
+    if relative_key.endswith(".json"):
+        return "JSON artifact generated during dataset analysis."
+    return "Generated artifact from the analytics pipeline."
+
+
+def _manifest_entries_for_artifacts(
+    artifact_contents: Mapping[str, Mapping[str, Any]],
+    artifact_prefix: str,
+) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for relative_key in sorted(artifact_contents.keys()):
+        spec = artifact_contents[relative_key]
+        description = spec.get("description")
+        if not isinstance(description, str) or not description.strip():
+            description = _default_description_for_artifact(relative_key, spec)
+        content_type = _guess_content_type_for_artifact(relative_key, spec)
+        entries.append(
+            {
+                "name": relative_key.replace("/", "_"),
+                "description": description,
+                "contentType": content_type,
+                "key": f"{artifact_prefix}/{relative_key}",
+            }
+        )
+    return entries
+
+
 def _build_curated_bundles(
     phases: Mapping[str, Mapping[str, Any]],
     artifact_contents: Mapping[str, Mapping[str, Any]],
@@ -801,10 +881,12 @@ def _build_curated_bundles(
         body = _artifact_bytes_for_bundle(spec)
         if body is None:
             continue
-        if relative_key.startswith("results/graphs/"):
-            visualization_files[relative_key[len("results/graphs/"):]] = body
-        elif relative_key.startswith("results/"):
-            summary_files[relative_key[len("results/"):]] = body
+        if relative_key.startswith("results/"):
+            trimmed = relative_key[len("results/"):]
+            if _is_visualization_artifact(relative_key, spec):
+                visualization_files[trimmed] = body
+            else:
+                summary_files[trimmed] = body
 
     if summary_files:
         bundles["results/bundles/analytics_bundle.zip"] = {
@@ -2498,15 +2580,7 @@ def finalize_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
             }
         )
 
-    for relative_key, spec in artifact_contents.items():
-        manifest_entries.append(
-            {
-                "name": relative_key.replace("/", "_"),
-                "description": spec.get("description"),
-                "contentType": spec.get("contentType"),
-                "key": f"{artifact_prefix}/{relative_key}",
-            }
-        )
+    manifest_entries.extend(_manifest_entries_for_artifacts(artifact_contents, artifact_prefix))
 
     manifest_entries.append(
         {
