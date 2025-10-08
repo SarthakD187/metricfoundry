@@ -13,6 +13,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -20,6 +21,7 @@ import boto3
 from botocore.exceptions import ClientError
 import requests
 from sqlalchemy import create_engine, text
+from sqlalchemy.dialects import registry
 from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
 s3 = boto3.client("s3")
@@ -33,6 +35,55 @@ ARTIFACTS_BUCKET = os.environ["ARTIFACTS_BUCKET"]
 STATUS_STAGING = "STAGING"
 STATUS_STAGED = "STAGED"
 STATUS_FAILED = "FAILED"
+
+
+def _register_sqlalchemy_dialects() -> None:
+    """Register optional warehouse dialects when their drivers are present."""
+
+    targets = [
+        (
+            "snowflake.sqlalchemy",
+            "snowflake.sqlalchemy",
+            "dialect",
+            ["snowflake"],
+        ),
+        (
+            "sqlalchemy_redshift.dialect",
+            "sqlalchemy_redshift.dialect",
+            "RedshiftDialect_psycopg2",
+            ["redshift"],
+        ),
+        (
+            "sqlalchemy_redshift.dialect",
+            "sqlalchemy_redshift.dialect",
+            "RedshiftDialect_redshift_connector",
+            ["redshift+redshift_connector"],
+        ),
+        (
+            "pybigquery.sqlalchemy_bigquery",
+            "pybigquery.sqlalchemy_bigquery",
+            "BigQueryDialect",
+            ["bigquery", "bigquery+pybigquery"],
+        ),
+        (
+            "databricks.sqlalchemy",
+            "databricks.sqlalchemy",
+            "DatabricksDialect",
+            ["databricks", "databricks+connector"],
+        ),
+    ]
+
+    for module_name, target_module, dialect_cls, aliases in targets:
+        try:
+            import_module(module_name)
+        except ImportError:
+            continue
+
+        for alias in aliases:
+            registry.register(alias, target_module, dialect_cls)
+
+
+_register_sqlalchemy_dialects()
 
 
 class FileNotReadyError(Exception):

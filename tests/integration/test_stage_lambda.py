@@ -164,6 +164,46 @@ def stage_lambda(monkeypatch):
     return module, fake_s3, fake_table, fake_secrets, fake_ssm
 
 
+def test_stage_lambda_registers_warehouse_dialects(stage_lambda, monkeypatch):
+    module, *_ = stage_lambda
+
+    registered: list[tuple[str, str, str]] = []
+
+    def fake_register(name: str, module_path: str, cls_name: str) -> None:
+        registered.append((name, module_path, cls_name))
+
+    monkeypatch.setattr(module.registry, "register", fake_register)
+
+    available = {
+        "snowflake.sqlalchemy",
+        "sqlalchemy_redshift.dialect",
+        "pybigquery.sqlalchemy_bigquery",
+        "databricks.sqlalchemy",
+    }
+
+    def fake_import(name: str):
+        if name in available:
+            return object()
+        raise ImportError
+
+    monkeypatch.setattr(module, "import_module", fake_import)
+
+    module._register_sqlalchemy_dialects()
+
+    expected_entries = [
+        ("snowflake", "snowflake.sqlalchemy", "dialect"),
+        ("redshift", "sqlalchemy_redshift.dialect", "RedshiftDialect_psycopg2"),
+        ("redshift+redshift_connector", "sqlalchemy_redshift.dialect", "RedshiftDialect_redshift_connector"),
+        ("bigquery", "pybigquery.sqlalchemy_bigquery", "BigQueryDialect"),
+        ("bigquery+pybigquery", "pybigquery.sqlalchemy_bigquery", "BigQueryDialect"),
+        ("databricks", "databricks.sqlalchemy", "DatabricksDialect"),
+        ("databricks+connector", "databricks.sqlalchemy", "DatabricksDialect"),
+    ]
+
+    for entry in expected_entries:
+        assert entry in registered
+
+
 @pytest.mark.parametrize(
     "job_source, bucket, key, body, content_type, expected_format",
     [
