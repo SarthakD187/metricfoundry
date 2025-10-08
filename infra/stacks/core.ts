@@ -7,6 +7,7 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as sfn from "aws-cdk-lib/aws-stepfunctions";
 import * as tasks from "aws-cdk-lib/aws-stepfunctions-tasks";
+import * as ssm from "aws-cdk-lib/aws-ssm";
 
 export class MetricFoundryCoreStack extends Stack {
   public readonly artifacts: s3.Bucket;
@@ -181,6 +182,27 @@ export class MetricFoundryCoreStack extends Stack {
     this.jobsStateMachine = new sfn.StateMachine(this, "JobsStateMachine", {
       definition: stageTask.next(processTask),
       timeout: Duration.minutes(15),
+    });
+
+    // ------------------------------------------------------------------
+    // Centralised configuration references in Parameter Store
+    // ------------------------------------------------------------------
+    new ssm.StringParameter(this, "ArtifactsBucketParameter", {
+      parameterName: "/metricfoundry/storage/artifactsBucket",
+      description: "Name of the S3 bucket storing MetricFoundry job artifacts",
+      stringValue: this.artifacts.bucketName,
+    });
+
+    new ssm.StringParameter(this, "JobsTableParameter", {
+      parameterName: "/metricfoundry/dynamodb/jobsTable",
+      description: "DynamoDB table that tracks MetricFoundry jobs",
+      stringValue: this.jobsTable.tableName,
+    });
+
+    new ssm.StringParameter(this, "JobsWorkflowParameter", {
+      parameterName: "/metricfoundry/workflows/jobsStateMachineArn",
+      description: "ARN of the Step Functions state machine that powers job execution",
+      stringValue: this.jobsStateMachine.stateMachineArn,
     });
   }
 }

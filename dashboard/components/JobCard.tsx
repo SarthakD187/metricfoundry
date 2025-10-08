@@ -12,7 +12,7 @@ interface JobCardProps {
 export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
   const [showArtifacts, setShowArtifacts] = useState(false);
   const [showManifest, setShowManifest] = useState(false);
-  const [manifest, setManifest] = useState<unknown>(null);
+  const [manifest, setManifest] = useState<string | null>(null);
   const [manifestError, setManifestError] = useState<string | null>(null);
   const [manifestLoading, setManifestLoading] = useState(false);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
@@ -30,7 +30,7 @@ export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
       setManifestLoading(true);
       setManifestError(null);
       const response = await fetchManifest(job.jobId);
-      setManifest(response.manifest);
+      setManifest(JSON.stringify(response.manifest, null, 2));
     } catch (error) {
       console.error('Failed to load manifest', error);
       setManifestError(error instanceof Error ? error.message : 'Unable to load manifest');
@@ -112,9 +112,7 @@ export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
         <section className="manifest-viewer">
           {manifestLoading && <p className="loading">Loading manifest…</p>}
           {manifestError && <div className="error-banner">{manifestError}</div>}
-          {manifest && !manifestLoading && (
-            <pre>{JSON.stringify(manifest, null, 2)}</pre>
-          )}
+          {manifest && !manifestLoading && <pre>{manifest}</pre>}
         </section>
       )}
 
