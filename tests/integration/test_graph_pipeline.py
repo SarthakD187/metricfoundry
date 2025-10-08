@@ -7,6 +7,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import zipfile
 from types import ModuleType
 from typing import Iterable, List
 
@@ -191,13 +192,28 @@ def test_pipeline_ingests_diverse_formats(key, body, expected_format):
     assert f"artifacts/{job_id}/results/manifest.json" in manifest_keys
     assert f"artifacts/{job_id}/results/bundles/analytics_bundle.zip" in manifest_keys
     assert f"artifacts/{job_id}/phases/phase_payloads.zip" in manifest_keys
+    assert f"artifacts/{job_id}/results/report.html" in manifest_keys
+    assert any(key.startswith(f"artifacts/{job_id}/results/graphs/") for key in manifest_keys)
 
     contents_keys = result.artifact_contents.keys()
     assert "results/descriptive_stats.csv" in contents_keys
     assert "results/report.txt" in contents_keys
     assert "results/report.html" in contents_keys
     assert "results/bundles/analytics_bundle.zip" in contents_keys
+    assert any(key.startswith("results/graphs/") for key in contents_keys)
     assert "phases/phase_payloads.zip" in contents_keys
+
+    analytics_bundle = result.artifact_contents["results/bundles/analytics_bundle.zip"]["data"]
+    with zipfile.ZipFile(io.BytesIO(analytics_bundle)) as archive:
+        bundle_names = set(archive.namelist())
+    assert "report.html" in bundle_names
+    assert "report.txt" in bundle_names
+
+    visualization_bundle = result.artifact_contents["results/bundles/visualizations.zip"]["data"]
+    with zipfile.ZipFile(io.BytesIO(visualization_bundle)) as archive:
+        visualization_names = archive.namelist()
+    assert visualization_names
+    assert any(name.endswith(".png") for name in visualization_names)
 
     ml_phase = result.phases["ml_inference"]
     assert isinstance(ml_phase, dict)
