@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import codecs
+import contextlib
 import csv
 import gzip
 import io
@@ -14,7 +15,22 @@ import tarfile
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
-from typing import IO, Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union, cast
+from typing import (
+    IO,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 from langgraph.graph import END, StateGraph
 
@@ -40,6 +56,7 @@ _MAX_HISTOGRAMS = 8
 _MAX_SCATTERS = 3
 
 _DELIMITED_STREAM_CHUNK_SIZE = 64 * 1024
+_ARCHIVE_STREAM_CHUNK_SIZE = 4 * 1024 * 1024
 
 
 BinaryInput = Union[bytes, bytearray, IO[bytes]]
@@ -62,6 +79,38 @@ def _ensure_bytes(body: BinaryInput) -> bytes:
         return bytes(body)
     data = cast(IO[bytes], body).read()
     return data
+
+
+@contextlib.contextmanager
+def _open_archive_stream(body: BinaryInput) -> Iterator[IO[bytes]]:
+    stream, should_close = _open_binary_stream(body)
+    temp_file: Optional[tempfile.NamedTemporaryFile] = None
+    try:
+        try:
+            stream.seek(0)
+        except (AttributeError, OSError, io.UnsupportedOperation):
+            temp_file = tempfile.NamedTemporaryFile(
+                prefix="metricfoundry-archive-", suffix=".tmp"
+            )
+            while True:
+                chunk = stream.read(_ARCHIVE_STREAM_CHUNK_SIZE)
+                if not chunk:
+                    break
+                temp_file.write(chunk)
+            temp_file.flush()
+            temp_file.seek(0)
+            if should_close:
+                stream.close()
+                should_close = False
+            stream = temp_file
+        else:
+            stream.seek(0)
+        yield stream
+    finally:
+        if should_close:
+            stream.close()
+        if temp_file is not None:
+            temp_file.close()
 
 
 _MATPLOTLIB_SETUP = False
@@ -553,37 +602,38 @@ def _zip_member_priority(name: str) -> Tuple[int, str]:
     return len(_ZIP_PREFERRED_EXTENSIONS), lowered
 
 
-def _ingest_zip(key: str, body: bytes) -> DatasetSummary:
+def _ingest_zip(key: str, body: BinaryInput) -> DatasetSummary:
     try:
-        with zipfile.ZipFile(io.BytesIO(body)) as archive:
-            members = [info for info in archive.infolist() if not info.is_dir()]
-            members.sort(key=lambda info: _zip_member_priority(info.filename))
-            for info in members:
-                data = archive.read(info.filename)
-                try:
-                    return ingest_dataset(info.filename, data)
-                except ValueError:
-                    continue
+        with _open_archive_stream(body) as archive_stream:
+            with zipfile.ZipFile(archive_stream) as archive:
+                members = [info for info in archive.infolist() if not info.is_dir()]
+                members.sort(key=lambda info: _zip_member_priority(info.filename))
+                for info in members:
+                    with archive.open(info, "r") as handle:
+                        try:
+                            return ingest_dataset(info.filename, handle)
+                        except ValueError:
+                            continue
     except zipfile.BadZipFile as exc:
         raise ValueError(f"Invalid ZIP archive: {key}") from exc
     raise ValueError(f"ZIP archive does not contain a supported dataset: {key}")
 
 
-def _ingest_tar(key: str, body: bytes) -> DatasetSummary:
+def _ingest_tar(key: str, body: BinaryInput) -> DatasetSummary:
     try:
-        with tarfile.open(fileobj=io.BytesIO(body), mode="r:*") as archive:
-            members = [member for member in archive.getmembers() if member.isfile()]
-            members.sort(key=lambda member: _zip_member_priority(member.name))
-            for member in members:
-                handle = archive.extractfile(member)
-                if handle is None:
-                    continue
-                data = handle.read()
-                handle.close()
-                try:
-                    return ingest_dataset(member.name, data)
-                except ValueError:
-                    continue
+        with _open_archive_stream(body) as archive_stream:
+            with tarfile.open(fileobj=archive_stream, mode="r:*") as archive:
+                members = [member for member in archive.getmembers() if member.isfile()]
+                members.sort(key=lambda member: _zip_member_priority(member.name))
+                for member in members:
+                    handle = archive.extractfile(member)
+                    if handle is None:
+                        continue
+                    with contextlib.closing(handle) as extracted:
+                        try:
+                            return ingest_dataset(member.name, extracted)
+                        except ValueError:
+                            continue
     except tarfile.TarError as exc:
         raise ValueError(f"Invalid TAR archive: {key}") from exc
     raise ValueError(f"TAR archive does not contain a supported dataset: {key}")
@@ -601,15 +651,20 @@ def _strip_compression_suffix(name: str) -> str:
 def ingest_dataset(key: str, body: BinaryInput) -> DatasetSummary:
     lowered = key.lower()
     if lowered.endswith(".zip"):
-        return _ingest_zip(key, _ensure_bytes(body))
+        return _ingest_zip(key, body)
     if lowered.endswith(".tar") or lowered.endswith(".tar.gz") or lowered.endswith(".tgz"):
-        return _ingest_tar(key, _ensure_bytes(body))
+        return _ingest_tar(key, body)
     if lowered.endswith(".gz") or lowered.endswith(".gzip"):
+        stream, should_close = _open_binary_stream(body)
         try:
-            decompressed = gzip.decompress(_ensure_bytes(body))
-        except OSError as exc:
-            raise ValueError(f"Invalid GZIP payload: {key}") from exc
-        return ingest_dataset(_strip_compression_suffix(key), decompressed)
+            try:
+                with gzip.GzipFile(fileobj=stream) as decompressed:
+                    return ingest_dataset(_strip_compression_suffix(key), decompressed)
+            except OSError as exc:
+                raise ValueError(f"Invalid GZIP payload: {key}") from exc
+        finally:
+            if should_close:
+                stream.close()
     if lowered.endswith(".parquet") or lowered.endswith(".pq") or lowered.endswith(".pqt") or lowered.endswith(".parq"):
         return _ingest_parquet(_ensure_bytes(body))
     if lowered.endswith(".xlsx") or lowered.endswith(".xls") or lowered.endswith(".xlsm"):
