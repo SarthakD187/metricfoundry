@@ -351,8 +351,11 @@ def test_stage_lambda_database_secret(stage_lambda, tmp_path):
             "status": "QUEUED",
             "source": {
                 "type": "database",
-                "secretArn": secret_arn,
-                "secretField": "url",
+                "connection": {
+                    "type": "secretsManager",
+                    "secretArn": secret_arn,
+                    "secretField": "url",
+                },
                 "query": "SELECT value FROM secrets",
                 "filename": "secret.csv",
             },
@@ -390,7 +393,10 @@ def test_stage_lambda_database_parameter(stage_lambda, tmp_path):
             "status": "QUEUED",
             "source": {
                 "type": "database",
-                "parameterName": parameter_name,
+                "connection": {
+                    "type": "parameterStore",
+                    "parameterName": parameter_name,
+                },
                 "query": "SELECT value FROM parameters",
             },
         }

@@ -57,6 +57,79 @@ def _clean_config(config: Dict[str, object] | None) -> Dict[str, object]:
     return {key: value for key, value in (config or {}).items() if value is not None}
 
 
+def _build_sql_connection(config: Dict[str, object], *, source_label: str) -> Dict[str, object]:
+    """Normalise SQL connection metadata for databases and warehouses."""
+
+    connection_meta = config.get("connection")
+    secret_field = config.get("secretField")
+
+    if connection_meta is not None:
+        if not isinstance(connection_meta, dict):
+            raise HTTPException(status_code=400, detail=f"{source_label} connection must be a JSON object")
+        cleaned = _clean_config(connection_meta)
+        conn_type = str(cleaned.get("type") or "").lower()
+
+        # Infer type when absent for backwards compatibility.
+        if not conn_type:
+            if "secretArn" in cleaned or "arn" in cleaned:
+                conn_type = "secretsmanager"
+            elif "parameterName" in cleaned or "name" in cleaned:
+                conn_type = "parameterstore"
+            elif "url" in cleaned:
+                conn_type = "inline"
+
+        if conn_type in {"inline", "url"}:
+            url = cleaned.get("url")
+            if not url:
+                raise HTTPException(status_code=400, detail=f"{source_label} connection.url is required for inline connections")
+            return {"type": "inline", "url": url}
+
+        if conn_type in {"secretsmanager", "secret", "secrets"}:
+            secret_arn = cleaned.get("secretArn") or cleaned.get("arn")
+            if not secret_arn:
+                raise HTTPException(status_code=400, detail=f"{source_label} connection.secretArn is required for secrets manager connections")
+            payload: Dict[str, object] = {"type": "secretsManager", "secretArn": secret_arn}
+            field = cleaned.get("secretField") or secret_field
+            if field:
+                payload["secretField"] = field
+            return payload
+
+        if conn_type in {"parameterstore", "ssm", "systemsmanager"}:
+            parameter_name = cleaned.get("parameterName") or cleaned.get("name")
+            if not parameter_name:
+                raise HTTPException(status_code=400, detail=f"{source_label} connection.parameterName is required for parameter store connections")
+            payload = {"type": "parameterStore", "parameterName": parameter_name}
+            field = cleaned.get("secretField") or secret_field
+            if field:
+                payload["secretField"] = field
+            return payload
+
+        raise HTTPException(status_code=400, detail=f"Unsupported {source_label} connection.type")
+
+    url = config.get("url")
+    secret_arn = config.get("secretArn")
+    parameter_name = config.get("parameterName")
+
+    provided_connections = [value for value in [url, secret_arn, parameter_name] if value]
+    if not provided_connections:
+        raise HTTPException(status_code=400, detail=f"{source_label} jobs require a connection reference (url, secretArn, or parameterName)")
+    if len(provided_connections) > 1:
+        raise HTTPException(status_code=400, detail=f"{source_label} jobs must specify only one connection reference")
+
+    if url:
+        return {"type": "inline", "url": url}
+
+    if secret_arn:
+        payload = {"type": "secretsManager", "secretArn": secret_arn}
+    else:
+        payload = {"type": "parameterStore", "parameterName": parameter_name}
+
+    if secret_field:
+        payload["secretField"] = secret_field
+
+    return payload
+
+
 def _build_source(body: CreateJob, job_id: str) -> tuple[dict, Optional[str]]:
     """Normalise the user's request into an internal ``source`` descriptor.
 
@@ -107,51 +180,28 @@ def _build_source(body: CreateJob, job_id: str) -> tuple[dict, Optional[str]]:
         return _clean_config(source), None
 
     if source_type == "database":
-        url = config.get("url")
         query = config.get("query")
-        secret_arn = config.get("secretArn")
-        parameter_name = config.get("parameterName")
-        secret_field = config.get("secretField")
         if not query:
             raise HTTPException(status_code=400, detail="database jobs require query in source_config")
-        provided_connections = [value for value in [url, secret_arn, parameter_name] if value]
-        if not provided_connections:
-            raise HTTPException(status_code=400, detail="database jobs require a connection reference (url, secretArn, or parameterName)")
-        if len(provided_connections) > 1:
-            raise HTTPException(status_code=400, detail="database jobs must specify only one connection reference")
+        connection = _build_sql_connection(config, source_label="database")
         source = {
             "type": "database",
             "query": query,
             "params": config.get("params"),
             "filename": config.get("filename"),
             "format": config.get("format", "csv"),
+            "connection": connection,
         }
-        if url:
-            source["url"] = url
-        if secret_arn:
-            source["secretArn"] = secret_arn
-        if parameter_name:
-            source["parameterName"] = parameter_name
-        if secret_field:
-            source["secretField"] = secret_field
         return _clean_config(source), None
 
     if source_type == "warehouse":
         warehouse_type = (config.get("warehouseType") or config.get("type") or "").lower()
         if warehouse_type not in {"redshift", "snowflake", "bigquery", "databricks"}:
             raise HTTPException(status_code=400, detail="warehouseType must be redshift, snowflake, bigquery, or databricks")
-        url = config.get("url")
         query = config.get("query")
-        secret_arn = config.get("secretArn")
-        parameter_name = config.get("parameterName")
-        secret_field = config.get("secretField")
         if not query:
             raise HTTPException(status_code=400, detail="warehouse jobs require query in source_config")
-        provided_connections = [value for value in [url, secret_arn, parameter_name] if value]
-        if not provided_connections:
-            raise HTTPException(status_code=400, detail="warehouse jobs require a connection reference (url, secretArn, or parameterName)")
-        if len(provided_connections) > 1:
-            raise HTTPException(status_code=400, detail="warehouse jobs must specify only one connection reference")
+        connection = _build_sql_connection(config, source_label="warehouse")
         source = {
             "type": "warehouse",
             "warehouseType": warehouse_type,
@@ -159,15 +209,8 @@ def _build_source(body: CreateJob, job_id: str) -> tuple[dict, Optional[str]]:
             "params": config.get("params"),
             "filename": config.get("filename"),
             "format": config.get("format", "csv"),
+            "connection": connection,
         }
-        if url:
-            source["url"] = url
-        if secret_arn:
-            source["secretArn"] = secret_arn
-        if parameter_name:
-            source["parameterName"] = parameter_name
-        if secret_field:
-            source["secretField"] = secret_field
         return _clean_config(source), None
 
     raise HTTPException(status_code=400, detail="Unsupported source_type")

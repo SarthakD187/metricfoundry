@@ -91,6 +91,8 @@ def test_create_database_job_requires_config(api_app):
     job_id = response.json()["jobId"]
     record = api_app["module"].table.get_item({"pk": f"job#{job_id}", "sk": "meta"}).get("Item")
     assert record["source"]["format"] == "jsonl"
+    assert record["source"]["connection"]["type"] == "inline"
+    assert record["source"]["connection"]["url"] == "sqlite:///tmp/example.db"
 
 
 def test_create_database_job_with_secret(api_app):
@@ -109,8 +111,9 @@ def test_create_database_job_with_secret(api_app):
     assert response.status_code == 200
     job_id = response.json()["jobId"]
     record = api_app["module"].table.get_item({"pk": f"job#{job_id}", "sk": "meta"}).get("Item")
-    assert record["source"]["secretArn"].endswith(":database")
-    assert record["source"]["secretField"] == "url"
+    assert record["source"]["connection"]["type"] == "secretsManager"
+    assert record["source"]["connection"]["secretArn"].endswith(":database")
+    assert record["source"]["connection"]["secretField"] == "url"
 
 
 def test_create_database_job_rejects_multiple_connections(api_app):
@@ -158,7 +161,8 @@ def test_create_warehouse_job_validation(api_app):
     record = api_app["module"].table.get_item({"pk": f"job#{response.json()['jobId']}", "sk": "meta"}).get("Item")
     assert record["source"]["warehouseType"] == "snowflake"
     assert record["source"]["filename"] == "warehouse-output.csv"
-    assert record["source"]["secretArn"].endswith(":warehouse")
+    assert record["source"]["connection"]["type"] == "secretsManager"
+    assert record["source"]["connection"]["secretArn"].endswith(":warehouse")
 
 
 @pytest.mark.parametrize("path,expected_status", [(None, 200), ("data.csv", 200), ("missing.csv", 404)])

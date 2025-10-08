@@ -167,6 +167,54 @@ def _secret_payload_value(raw_value: str, *, field: Optional[str]) -> str:
 
 
 def _resolve_sql_connection(source: Dict[str, object]) -> str:
+    """Return a SQLAlchemy connection URL for the provided source."""
+
+    connection_meta = source.get("connection")
+    if connection_meta is not None:
+        if not isinstance(connection_meta, dict):
+            raise ValueError("SQL connection metadata must be an object")
+
+        conn_type = str(connection_meta.get("type") or "inline").lower()
+        secret_field = connection_meta.get("secretField")
+
+        if conn_type in {"inline", "url"}:
+            url = connection_meta.get("url")
+            if not isinstance(url, str) or not url.strip():
+                raise ValueError("Inline SQL connection requires a non-empty url")
+            return url.strip()
+
+        if conn_type in {"secretsmanager", "secret", "secrets"}:
+            secret_arn = connection_meta.get("secretArn") or connection_meta.get("arn")
+            if not isinstance(secret_arn, str) or not secret_arn:
+                raise ValueError("Secrets Manager connection requires secretArn")
+            try:
+                response = secretsmanager.get_secret_value(SecretId=secret_arn)
+            except ClientError as exc:
+                raise ValueError(f"Failed to retrieve secret {secret_arn}: {exc}") from exc
+            if "SecretString" in response and response["SecretString"] is not None:
+                raw_value = response["SecretString"]
+            elif "SecretBinary" in response and response["SecretBinary"] is not None:
+                raw_value = base64.b64decode(response["SecretBinary"]).decode("utf-8")
+            else:
+                raise ValueError(f"Secret {secret_arn} does not contain a value")
+            return _secret_payload_value(raw_value, field=secret_field)
+
+        if conn_type in {"parameterstore", "ssm", "systemsmanager"}:
+            parameter_name = connection_meta.get("parameterName") or connection_meta.get("name")
+            if not isinstance(parameter_name, str) or not parameter_name:
+                raise ValueError("Parameter Store connection requires parameterName")
+            try:
+                response = ssm.get_parameter(Name=parameter_name, WithDecryption=True)
+            except ClientError as exc:
+                raise ValueError(f"Failed to retrieve parameter {parameter_name}: {exc}") from exc
+            parameter = response.get("Parameter") or {}
+            raw_value = parameter.get("Value")
+            if raw_value is None:
+                raise ValueError(f"Parameter {parameter_name} does not contain a value")
+            return _secret_payload_value(raw_value, field=secret_field)
+
+        raise ValueError(f"Unsupported SQL connection type: {conn_type}")
+
     url = source.get("url")
     if isinstance(url, str) and url.strip():
         return url.strip()
@@ -199,7 +247,9 @@ def _resolve_sql_connection(source: Dict[str, object]) -> str:
             raise ValueError(f"Parameter {parameter_name} does not contain a value")
         return _secret_payload_value(raw_value, field=secret_field)
 
-    raise ValueError("SQL source requires a connection string via url, secretArn, or parameterName")
+    raise ValueError(
+        "SQL source requires a connection string via connection metadata, url, secretArn, or parameterName"
+    )
 
 
 def _extract_sql_source(job_id: str, source: Dict[str, object], *, default_name: str) -> SourceRef:
