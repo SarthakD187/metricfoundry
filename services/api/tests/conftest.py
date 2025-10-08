@@ -148,10 +148,18 @@ def api_app(monkeypatch):
     monkeypatch.setenv("TABLE_NAME", "metricfoundry-jobs")
     monkeypatch.setenv("STATE_MACHINE_ARN", "arn:aws:states:local:stateMachine:metricfoundry")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setenv("API_KEYS", "test-key")
+    monkeypatch.delenv("API_KEY_SECRET_ARN", raising=False)
+    monkeypatch.delenv("RATE_LIMIT_PER_MINUTE", raising=False)
+    monkeypatch.delenv("RATE_LIMIT_BURST", raising=False)
 
     from services.api import app as app_module
 
     importlib.reload(app_module)
+
+    app_module.RATE_LIMIT_CONFIG["per_minute"] = 120
+    app_module.RATE_LIMIT_CONFIG["burst"] = 60
+    app_module.reset_rate_limiter()
 
     fake_s3 = InMemoryS3()
     fake_table = FakeDynamoTable()
@@ -167,8 +175,14 @@ def api_app(monkeypatch):
     async_client = httpx.AsyncClient(transport=transport, base_url="http://testserver")
 
     class SyncClient:
+        def __init__(self, default_headers: dict[str, str]):
+            self._default_headers = default_headers
+
         def request(self, method: str, url: str, **kwargs):
-            return anyio.run(lambda: async_client.request(method, url, **kwargs))
+            headers = dict(self._default_headers)
+            extra_headers = kwargs.pop("headers", None) or {}
+            headers.update(extra_headers)
+            return anyio.run(lambda: async_client.request(method, url, headers=headers, **kwargs))
 
         def get(self, url: str, **kwargs):
             return self.request("GET", url, **kwargs)
@@ -176,11 +190,13 @@ def api_app(monkeypatch):
         def post(self, url: str, **kwargs):
             return self.request("POST", url, **kwargs)
 
-    client = SyncClient()
+    client = SyncClient({"x-api-key": "test-key"})
+    raw_client = SyncClient({})
 
     try:
         yield {
             "client": client,
+            "raw_client": raw_client,
             "module": app_module,
             "sfn": fake_sfn,
             "cloudwatch": fake_cw,

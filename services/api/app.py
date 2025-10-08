@@ -1,17 +1,20 @@
 # services/api/app.py
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import time
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Dict, Iterable, List, Optional
 
 import boto3
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from mangum import Mangum
 from pydantic import BaseModel
 
@@ -19,6 +22,23 @@ from pydantic import BaseModel
 BUCKET_NAME = os.environ["BUCKET_NAME"]          # artifacts bucket
 TABLE_NAME  = os.environ["TABLE_NAME"]           # DynamoDB table
 STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
+API_KEY_SECRET_ARN = os.environ.get("API_KEY_SECRET_ARN")
+STATIC_API_KEYS = [key.strip() for key in os.environ.get("API_KEYS", "").split(",") if key.strip()]
+
+def _load_rate_limit_setting(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):  # pragma: no cover - defensive parsing
+        return default
+    return max(0, value)
+
+
+RATE_LIMIT_CONFIG = {
+    "per_minute": _load_rate_limit_setting("RATE_LIMIT_PER_MINUTE", 120),
+    "burst": _load_rate_limit_setting("RATE_LIMIT_BURST", _load_rate_limit_setting("RATE_LIMIT_PER_MINUTE", 120)),
+}
+if RATE_LIMIT_CONFIG["burst"] == 0 and RATE_LIMIT_CONFIG["per_minute"] > 0:
+    RATE_LIMIT_CONFIG["burst"] = RATE_LIMIT_CONFIG["per_minute"]
 
 # ---- Logging & Observability ----
 logger = logging.getLogger("metricfoundry.api")
@@ -34,8 +54,17 @@ ddb = boto3.resource("dynamodb")
 table = ddb.Table(TABLE_NAME)
 sfn = boto3.client("stepfunctions")
 cloudwatch = boto3.client("cloudwatch")
+secrets_manager = boto3.client("secretsmanager")
 
 app = FastAPI(title="MetricFoundry API")
+
+_RATE_LIMIT_STATE: dict[str, dict[str, float]] = {}
+
+
+def reset_rate_limiter():
+    """Utility used in tests to reset the in-memory limiter state."""
+
+    _RATE_LIMIT_STATE.clear()
 
 # ---- Models ----
 class CreateJob(BaseModel):
@@ -190,6 +219,65 @@ def record_metric(name: str, value: float = 1, unit: str = "Count", dimensions: 
 
 def epoch() -> int:
     return int(time.time())
+
+
+@lru_cache(maxsize=1)
+def load_api_keys() -> frozenset[str]:
+    keys = {key for key in STATIC_API_KEYS}
+
+    if API_KEY_SECRET_ARN:
+        try:
+            secret_value = secrets_manager.get_secret_value(SecretId=API_KEY_SECRET_ARN)
+        except ClientError as exc:
+            logger.error("failed to load API key secret", extra={"error": str(exc)})
+        else:
+            secret_string = secret_value.get("SecretString")
+            if secret_string:
+                try:
+                    payload = json.loads(secret_string)
+                except json.JSONDecodeError:
+                    keys.add(secret_string)
+                else:
+                    if isinstance(payload, dict):
+                        candidate = payload.get("apiKey")
+                        if isinstance(candidate, str):
+                            keys.add(candidate)
+                        else:
+                            for value in payload.values():
+                                if isinstance(value, str):
+                                    keys.add(value)
+                    elif isinstance(payload, list):
+                        keys.update(str(item) for item in payload if isinstance(item, str))
+                    elif isinstance(payload, str):
+                        keys.add(payload)
+            secret_binary = secret_value.get("SecretBinary")
+            if secret_binary:
+                try:
+                    decoded = base64.b64decode(secret_binary).decode("utf-8")
+                    keys.add(decoded)
+                except Exception as exc:  # pragma: no cover - defensive guard for decoding issues
+                    logger.warning("failed to decode binary API key secret", extra={"error": str(exc)})
+
+    return frozenset(keys)
+
+
+def _rate_limit_allow(api_key: str) -> bool:
+    if RATE_LIMIT_CONFIG["per_minute"] <= 0:
+        return True
+
+    now = time.time()
+    state = _RATE_LIMIT_STATE.get(api_key, {"tokens": RATE_LIMIT_CONFIG["burst"], "updated": now})
+
+    elapsed = now - state["updated"]
+    refill_rate = RATE_LIMIT_CONFIG["per_minute"] / 60 if RATE_LIMIT_CONFIG["per_minute"] > 0 else 0
+    tokens = min(RATE_LIMIT_CONFIG["burst"], state["tokens"] + elapsed * refill_rate)
+
+    if tokens < 1:
+        _RATE_LIMIT_STATE[api_key] = {"tokens": tokens, "updated": now}
+        return False
+
+    _RATE_LIMIT_STATE[api_key] = {"tokens": tokens - 1, "updated": now}
+    return True
 
 
 def ddb_put_job(job_id: str, status: str, source: dict, created: int):
@@ -496,6 +584,32 @@ def get_job_results(job_id: str, path: Optional[str] = Query(default=None, descr
     return {"jobId": job_id, "downloadUrl": url, "key": key}
 
 # ---- Middleware ----
+@app.middleware("http")
+async def enforce_authentication(request: Request, call_next):
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    api_key = request.headers.get("x-api-key")
+    if not api_key:
+        record_metric("MissingApiKey", dimensions={"Path": request.url.path})
+        return JSONResponse({"detail": "Missing API key"}, status_code=401)
+
+    keys = load_api_keys()
+    if not keys:
+        logger.error("API authentication is not configured")
+        return JSONResponse({"detail": "Server configuration error"}, status_code=500)
+
+    if api_key not in keys:
+        record_metric("InvalidApiKey", dimensions={"Path": request.url.path})
+        return JSONResponse({"detail": "Invalid API key"}, status_code=403)
+
+    if not _rate_limit_allow(api_key):
+        record_metric("RateLimitExceeded", dimensions={"Path": request.url.path})
+        return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
+
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.time()

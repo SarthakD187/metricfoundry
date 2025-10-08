@@ -35,6 +35,24 @@ def test_create_upload_job_success(api_app):
     assert "JobQueued" in names
 
 
+def test_rate_limit_enforced(api_app):
+    client = api_app["client"]
+    module = api_app["module"]
+    module.RATE_LIMIT_CONFIG["per_minute"] = 2
+    module.RATE_LIMIT_CONFIG["burst"] = 2
+    module.reset_rate_limiter()
+
+    first = client.post("/jobs", json={"source_type": "upload"})
+    assert first.status_code == 200
+
+    second = client.post("/jobs", json={"source_type": "upload"})
+    assert second.status_code == 200
+
+    third = client.post("/jobs", json={"source_type": "upload"})
+    assert third.status_code == 429
+    assert third.json()["detail"] == "Rate limit exceeded"
+
+
 def test_create_job_validation_error(api_app):
     client = api_app["client"]
     response = client.post("/jobs", json={"source_type": "invalid"})
@@ -264,3 +282,16 @@ def test_results_path_outside_job_is_rejected(api_app):
         params={"path": "../manifest.json"},
     )
     assert resp.status_code == 400
+def test_requires_api_key(api_app):
+    client = api_app["raw_client"]
+    response = client.post("/jobs", json={"source_type": "upload"})
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Missing API key"
+
+
+def test_invalid_api_key(api_app):
+    client = api_app["raw_client"]
+    response = client.post("/jobs", json={"source_type": "upload"}, headers={"x-api-key": "nope"})
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid API key"
+

@@ -1,13 +1,48 @@
-# .github/workflows/ci.yml
-name: CI
-on: [push, pull_request]
+name: MetricFoundry CI
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '18' }
-      - run: npm ci || npm i
-      - run: npm run build
-      - run: npx cdk synth
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build infrastructure TypeScript
+        run: npm run build
+
+      - name: Install dashboard dependencies
+        run: npm --prefix dashboard install
+
+      - name: Build dashboard
+        run: npm --prefix dashboard run build
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run API unit tests
+        run: pytest services/api/tests
+
+      - name: Synthesize CDK application
+        run: npm run cdk:synth
