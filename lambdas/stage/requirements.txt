@@ -1,5 +1,5 @@
 requests==2.32.5
-SQLAlchemy==2.0.43
+SQLAlchemy==1.4.54
 snowflake-sqlalchemy~=1.5
 sqlalchemy-redshift~=0.8
 redshift-connector~=2.1
