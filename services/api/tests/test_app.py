@@ -246,3 +246,21 @@ def test_artifact_prefix_outside_job_is_rejected(api_app):
 
     resp = client.get(f"/jobs/{job_id}/artifacts", params={"prefix": "other/"})
     assert resp.status_code == 400
+
+    resp = client.get(
+        f"/jobs/{job_id}/artifacts",
+        params={"prefix": f"artifacts/{job_id}/../other"},
+    )
+    assert resp.status_code == 400
+
+
+def test_results_path_outside_job_is_rejected(api_app):
+    client = api_app["client"]
+    create_resp = client.post("/jobs", json={"source_type": "upload"})
+    job_id = create_resp.json()["jobId"]
+
+    resp = client.get(
+        f"/jobs/{job_id}/results",
+        params={"path": "../manifest.json"},
+    )
+    assert resp.status_code == 400
