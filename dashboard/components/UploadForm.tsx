@@ -75,11 +75,14 @@ export default function UploadForm({
   };
 
   return (
-    <div className="glass-panel uploader">
-      <p className="eyebrow">Upload</p>
-      <h2>New dataset</h2>
-      <p className="subtitle">
-        Drop a CSV here and we’ll upload it, kick off processing, and render a user-friendly analysis.
+    <div className="panel upload-panel">
+      <div className="panel-heading">
+        <p className="panel-label">Launch a run</p>
+        <h2>Upload a new dataset</h2>
+      </div>
+      <p className="panel-description">
+        Drag a CSV into the portal and we’ll handle the presigned upload, kick off processing, and surface live status
+        as the job progresses.
       </p>
 
       <div
@@ -100,10 +103,10 @@ export default function UploadForm({
           onChange={onInputChange}
         />
         {!busy && (
-          <>
-            <div className="dz-title">Drag & drop a CSV</div>
-            <div className="dz-sub">or click to choose a file</div>
-          </>
+          <div className="dz-copy">
+            <div className="dz-title">Drop CSV to ignite</div>
+            <div className="dz-sub">or click to browse files</div>
+          </div>
         )}
         {busy && (
           <div className="dz-status">
@@ -114,46 +117,73 @@ export default function UploadForm({
       </div>
 
       <style jsx>{`
-        .uploader {
+        .upload-panel {
           display: grid;
-          gap: 0.6rem;
+          gap: 1rem;
         }
         .dropzone {
-          border: 2px dashed rgba(0, 0, 0, 0.2);
-          border-radius: 1rem;
-          padding: 1.25rem;
+          position: relative;
+          border-radius: 22px;
+          padding: 2.25rem 1.75rem;
           text-align: center;
           cursor: pointer;
-          background: #fff;
+          border: 1px dashed rgba(224, 203, 168, 0.45);
+          background: radial-gradient(circle at top, rgba(136, 73, 143, 0.25), rgba(119, 159, 161, 0.08));
+          transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
         }
-        .dropzone:hover {
-          background: #fafafa;
+        .dropzone::after {
+          content: "";
+          position: absolute;
+          inset: 12px;
+          border-radius: 18px;
+          border: 1px solid rgba(255, 101, 66, 0.22);
+          opacity: 0;
+          transition: opacity 0.2s ease;
+          pointer-events: none;
+        }
+        .dropzone:hover,
+        .dropzone:focus-visible {
+          transform: translateY(-2px);
+          box-shadow: 0 28px 45px -38px rgba(255, 101, 66, 0.8);
+          border-color: rgba(255, 101, 66, 0.55);
+        }
+        .dropzone:hover::after,
+        .dropzone:focus-visible::after {
+          opacity: 1;
         }
         .dropzone.disabled {
-          opacity: 0.7;
+          opacity: 0.6;
           cursor: not-allowed;
+          box-shadow: none;
+        }
+        .dz-copy {
+          display: grid;
+          gap: 0.45rem;
+          color: #e0cba8;
         }
         .dz-title {
-          font-size: 1.05rem;
-          font-weight: 600;
+          font-size: 1.15rem;
+          font-weight: 700;
+          letter-spacing: 0.04em;
         }
         .dz-sub {
           font-size: 0.9rem;
-          opacity: 0.7;
+          color: rgba(224, 203, 168, 0.65);
         }
         .dz-status {
           display: inline-flex;
-          gap: 0.6rem;
+          gap: 0.75rem;
           align-items: center;
           justify-content: center;
           font-size: 0.95rem;
+          color: #e0cba8;
         }
         .spinner {
-          width: 16px;
-          height: 16px;
+          width: 18px;
+          height: 18px;
           border-radius: 50%;
-          border: 2px solid #000;
-          border-top-color: transparent;
+          border: 2px solid rgba(255, 101, 66, 0.5);
+          border-top-color: rgba(255, 101, 66, 0.9);
           display: inline-block;
           animation: spin 0.9s linear infinite;
         }

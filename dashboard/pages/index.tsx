@@ -217,6 +217,14 @@ export default function DashboardHome() {
     [jobs],
   );
 
+  const latestUpdate = useMemo(() => {
+    const timestamps = jobs
+      .map((job) => job.updatedAt ?? job.createdAt ?? null)
+      .filter((value): value is number => typeof value === "number" && value > 0);
+    if (timestamps.length === 0) return null;
+    return new Date(Math.max(...timestamps) * 1000);
+  }, [jobs]);
+
   useEffect(() => {
     if (!mounted || activeJobIds.length === 0) return;
     const interval = setInterval(() => {
@@ -232,22 +240,53 @@ export default function DashboardHome() {
       <Head>
         <title>MetricFoundry Dashboard</title>
       </Head>
-      <main className="page">
-        <section className="hero">
-          <div className="hero-content">
-            <span className="hero-badge">MetricFoundry</span>
-            <h1>Operational console for your data workflows</h1>
-            <p>
-              Upload datasets, orchestrate ingestion jobs, and view rich, user-friendly analyses of the results.
-            </p>
+      <main className="shell">
+        <span className="aurora aurora-one" aria-hidden />
+        <span className="aurora aurora-two" aria-hidden />
+        <header className="masthead">
+          <div className="brand">
+            <span className="brand-mark" />
+            <span className="brand-text">MetricFoundry</span>
           </div>
-          <div className="hero-panels">
+          <div className="masthead-copy">
+            <p>Realtime visibility for every ingestion and analysis job.</p>
+            <div className="masthead-glint" aria-hidden />
+          </div>
+        </header>
+
+        <section className="hero-block">
+          <div className="hero-copy">
+            <h1>
+              Shape data runs
+              <br />
+              with cinematic clarity
+            </h1>
+            <p>
+              Launch fresh uploads, monitor pipelines, and unlock shareable insights in a single immersive command
+              center tailored for modern data teams.
+            </p>
+            <div className="hero-metrics">
+              <div className="metric">
+                <span className="metric-label">Active jobs</span>
+                <span className="metric-value">{activeJobIds.length}</span>
+              </div>
+              <div className="metric">
+                <span className="metric-label">Tracked</span>
+                <span className="metric-value">{jobs.length}</span>
+              </div>
+              <div className="metric">
+                <span className="metric-label">Last update</span>
+                <span className="metric-value">{mounted && latestUpdate ? latestUpdate.toLocaleTimeString() : "—"}</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="hero-actions">
             <UploadForm
               onJobCreated={async () => {
                 const { jobId, uploadUrl } = await handleJobCreated();
                 return {
                   jobId,
-                  // Provide a concrete uploader so the component can PUT the file immediately:
                   upload: async (file: File | Blob) => {
                     await uploadToPresigned(uploadUrl, file);
                     await handleUpload(jobId, file);
@@ -257,64 +296,67 @@ export default function DashboardHome() {
               }}
               onError={(message) => setGlobalError(message)}
             />
-            <form className="glass-panel inline-form" onSubmit={handleExistingJobSubmit}>
-              <p className="eyebrow">Track an existing job</p>
-              <h2>Already have a job ID?</h2>
-              <p className="subtitle">Paste it below to monitor and load outputs.</p>
-              <div className="form-grid">
-                <label className="field">
-                  <span>Job ID</span>
-                  <input
-                    type="text"
-                    value={existingJobId}
-                    onChange={(event) => setExistingJobId(event.target.value)}
-                    placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                  />
-                </label>
+
+            <form className="panel existing-job" onSubmit={handleExistingJobSubmit}>
+              <div className="panel-heading">
+                <p className="panel-label">Follow a job</p>
+                <h2>Reconnect to an existing run</h2>
               </div>
+              <p className="panel-description">
+                Drop in a job identifier to resume monitoring and retrieve the freshest artifacts instantly.
+              </p>
+              <label className="field">
+                <span>Job ID</span>
+                <input
+                  type="text"
+                  value={existingJobId}
+                  onChange={(event) => setExistingJobId(event.target.value)}
+                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                />
+              </label>
               <div className="form-actions">
-                <button type="submit">Add job</button>
+                <button type="submit" className="action">
+                  Add job
+                </button>
               </div>
             </form>
           </div>
         </section>
 
-        {globalError && <div className="error-banner global">{globalError}</div>}
+        {globalError && <div className="toast toast-error">{globalError}</div>}
 
         {activeResult && (
-          <section className="result-banner">
-            <div className="glass-panel">
-              <p className="eyebrow">Latest analysis</p>
-              <h3>Results for job {activeResult.jobId}</h3>
-              <ResultsViewer
-                jobId={activeResult.jobId}
-                data={activeResult.json}
-                downloadUrl={activeResult.downloadUrl}
-              />
+          <section className="results-stage">
+            <div className="panel spotlight">
+              <div className="panel-heading">
+                <p className="panel-label">Latest analysis</p>
+                <h2>Job {activeResult.jobId}</h2>
+              </div>
+              <ResultsViewer jobId={activeResult.jobId} data={activeResult.json} downloadUrl={activeResult.downloadUrl} />
             </div>
           </section>
         )}
 
-        <section className="jobs-section">
-          <div className="section-heading">
+        <section className="jobs-board">
+          <div className="board-heading">
             <div>
-              <p className="eyebrow">Jobs</p>
+              <p className="panel-label">Job timeline</p>
               <h2>Recent activity</h2>
             </div>
-            <p className="subtitle">
-              Jobs are stored locally in your browser for convenience. Remove entries here without affecting backend data.
+            <p className="board-copy">
+              Job metadata lives locally for instant recall. Clean up entries here without touching the remote pipeline.
             </p>
           </div>
 
           {!mounted ? (
-            <div className="empty-state">
-              <h3>Loading…</h3>
-              <p>Preparing your recent jobs.</p>
+            <div className="empty-panel">
+              <h3>Preparing your workspace</h3>
+              <p>Hang tight while we hydrate your stored jobs.</p>
             </div>
           ) : jobs.length === 0 ? (
-            <div className="empty-state">
-              <h3>No jobs yet</h3>
-              <p>Create a job above to see it appear here.</p>
+            <div className="empty-panel">
+              <h3>No runs yet</h3>
+              <p>Launch a dataset upload above to see it stream in here.</p>
             </div>
           ) : (
             <div className="jobs-grid">
@@ -327,52 +369,293 @@ export default function DashboardHome() {
       </main>
 
       <style jsx>{`
-        .page { padding: 1.25rem; }
-        .hero { display: grid; grid-template-columns: 1.2fr 1fr; gap: 1rem; margin-bottom: 1rem; }
-        .hero-badge { font-size: 0.75rem; opacity: 0.6; }
-        .hero-panels { display: grid; gap: 1rem; }
-        .glass-panel {
-          border: 1px solid rgba(0,0,0,0.1);
-          border-radius: 1rem;
-          padding: 1rem;
-          background: #fff;
+        .shell {
+          position: relative;
+          min-height: 100vh;
+          padding: clamp(2rem, 4vw, 4rem);
+          display: flex;
+          flex-direction: column;
+          gap: clamp(2.5rem, 5vw, 4.5rem);
         }
-        .inline-form .form-grid { display: grid; gap: 0.6rem; }
-        .inline-form input {
-          width: 100%;
-          padding: 0.6rem 0.8rem;
-          border-radius: 0.6rem;
-          border: 1px solid rgba(0,0,0,0.15);
+        .aurora {
+          position: fixed;
+          border-radius: 999px;
+          filter: blur(90px);
+          opacity: 0.6;
+          animation: float 14s ease-in-out infinite;
+          pointer-events: none;
         }
-        .inline-form .form-actions { margin-top: 0.5rem; }
-        .inline-form button {
-          padding: 0.5rem 0.8rem;
-          border-radius: 0.6rem;
-          background: #000;
-          color: #fff;
+        .aurora-one {
+          width: 420px;
+          height: 420px;
+          background: radial-gradient(circle, rgba(136, 73, 143, 0.65), rgba(86, 65, 84, 0));
+          top: -120px;
+          right: -160px;
+          animation-delay: -4s;
         }
-        .result-banner { max-width: 1100px; margin: 0 auto 1rem; }
-        .jobs-section .section-heading {
-          display: flex; align-items: flex-end; justify-content: space-between;
-          margin: 0.5rem 0 0.75rem;
+        .aurora-two {
+          width: 380px;
+          height: 380px;
+          background: radial-gradient(circle, rgba(255, 101, 66, 0.5), rgba(136, 73, 143, 0));
+          bottom: -140px;
+          left: -120px;
         }
-        .jobs-grid { display: grid; gap: 0.75rem; grid-template-columns: 1fr; }
-        .empty-state {
-          border: 1px dashed rgba(0,0,0,0.2);
-          border-radius: 1rem;
-          padding: 1rem;
+        @keyframes float {
+          0%,
+          100% {
+            transform: translate3d(0, 0, 0);
+          }
+          50% {
+            transform: translate3d(12px, -14px, 0) scale(1.04);
+          }
+        }
+        .masthead {
+          display: flex;
+          flex-direction: column;
+          gap: 0.75rem;
+          position: relative;
+        }
+        .brand {
+          display: inline-flex;
+          align-items: center;
+          gap: 0.65rem;
+          font-weight: 700;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          color: #e0cba8;
+        }
+        .brand-mark {
+          width: 32px;
+          height: 32px;
+          border-radius: 10px;
+          background: linear-gradient(135deg, rgba(255, 101, 66, 0.8), rgba(136, 73, 143, 0.8));
+          box-shadow: 0 0 0 1px rgba(224, 203, 168, 0.4);
+        }
+        .brand-text {
+          font-size: 0.85rem;
+        }
+        .masthead-copy {
+          display: flex;
+          align-items: center;
+          gap: 1.5rem;
+          color: rgba(224, 203, 168, 0.75);
+          font-size: 0.95rem;
+        }
+        .masthead-glint {
+          flex: 1;
+          height: 2px;
+          background: linear-gradient(
+            90deg,
+            rgba(224, 203, 168, 0),
+            rgba(224, 203, 168, 0.9),
+            rgba(224, 203, 168, 0)
+          );
+          animation: shimmer 6s linear infinite;
+        }
+        @keyframes shimmer {
+          0% {
+            opacity: 0.2;
+          }
+          50% {
+            opacity: 1;
+          }
+          100% {
+            opacity: 0.2;
+          }
+        }
+        .hero-block {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+          gap: clamp(1.75rem, 3vw, 2.5rem);
+        }
+        .hero-copy {
+          display: grid;
+          gap: 1.4rem;
+        }
+        .hero-copy h1 {
+          margin: 0;
+          font-size: clamp(2.6rem, 4vw, 3.6rem);
+          line-height: 1.05;
+          color: #ff6542;
+          text-shadow: 0 6px 22px rgba(255, 101, 66, 0.35);
+        }
+        .hero-copy p {
+          margin: 0;
+          font-size: 1.05rem;
+          color: rgba(224, 203, 168, 0.78);
+        }
+        .hero-metrics {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 0.75rem;
+        }
+        .metric {
+          padding: 1rem 1.1rem;
+          border-radius: 20px;
+          background: rgba(119, 159, 161, 0.18);
+          border: 1px solid rgba(224, 203, 168, 0.28);
+          display: grid;
+          gap: 0.4rem;
+          box-shadow: 0 16px 32px -24px rgba(86, 65, 84, 0.55);
+        }
+        .metric-label {
+          font-size: 0.75rem;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          color: rgba(224, 203, 168, 0.6);
+        }
+        .metric-value {
+          font-size: 1.45rem;
+          font-weight: 700;
+          color: #e0cba8;
+        }
+        .hero-actions {
+          display: grid;
+          gap: 1.5rem;
+        }
+        .panel {
+          position: relative;
+          border-radius: 28px;
+          padding: clamp(1.6rem, 3vw, 2.2rem);
+          background: linear-gradient(145deg, rgba(86, 65, 84, 0.66), rgba(119, 159, 161, 0.18));
+          border: 1px solid rgba(224, 203, 168, 0.25);
+          box-shadow: 0 30px 60px -40px rgba(86, 65, 84, 0.7);
+          backdrop-filter: blur(14px);
+        }
+        .panel::after {
+          content: "";
+          position: absolute;
+          inset: 0;
+          border-radius: inherit;
+          border: 1px solid rgba(255, 101, 66, 0.12);
+          mask: linear-gradient(180deg, rgba(86, 65, 84, 0.3), transparent 60%);
+          pointer-events: none;
+        }
+        .panel-heading {
+          display: grid;
+          gap: 0.4rem;
+          margin-bottom: 0.75rem;
+        }
+        .panel-label {
+          margin: 0;
+          font-size: 0.75rem;
+          font-weight: 700;
+          letter-spacing: 0.12em;
+          text-transform: uppercase;
+          color: rgba(224, 203, 168, 0.62);
+        }
+        .panel-heading h2 {
+          margin: 0;
+          font-size: 1.6rem;
+          color: #e0cba8;
+        }
+        .panel-description {
+          margin: 0 0 1rem;
+          color: rgba(224, 203, 168, 0.68);
+          font-size: 0.95rem;
+        }
+        .existing-job .field {
+          display: grid;
+          gap: 0.5rem;
+          color: rgba(224, 203, 168, 0.75);
+          font-weight: 600;
+        }
+        .existing-job input {
+          border-radius: 16px;
+          padding: 0.75rem 1rem;
+          border: 1px solid rgba(224, 203, 168, 0.35);
+          background: rgba(86, 65, 84, 0.65);
+          color: #e0cba8;
+        }
+        .existing-job input::placeholder {
+          color: rgba(224, 203, 168, 0.4);
+        }
+        .existing-job input:focus {
+          outline: 2px solid rgba(255, 101, 66, 0.5);
+          outline-offset: 2px;
+        }
+        .form-actions {
+          margin-top: 1.25rem;
+        }
+        .action {
+          border: none;
+          border-radius: 999px;
+          padding: 0.75rem 1.6rem;
+          font-size: 0.95rem;
+          font-weight: 700;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          color: #564154;
+          background: linear-gradient(135deg, rgba(255, 101, 66, 0.92), rgba(224, 203, 168, 0.92));
+          box-shadow: 0 22px 40px -30px rgba(255, 101, 66, 0.8);
+          cursor: pointer;
+          transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .action:hover,
+        .action:focus-visible {
+          transform: translateY(-2px);
+          box-shadow: 0 26px 60px -24px rgba(255, 101, 66, 0.85);
+        }
+        .toast {
+          align-self: center;
+          padding: 0.75rem 1.5rem;
+          border-radius: 999px;
+          border: 1px solid rgba(255, 101, 66, 0.45);
+          color: #ff6542;
+          background: rgba(255, 101, 66, 0.12);
+          font-weight: 600;
+        }
+        .results-stage {
+          display: flex;
+          justify-content: center;
+        }
+        .spotlight {
+          width: min(100%, 1120px);
+        }
+        .jobs-board {
+          display: grid;
+          gap: 1.75rem;
+        }
+        .board-heading {
+          display: flex;
+          flex-direction: column;
+          gap: 0.75rem;
+        }
+        .board-heading h2 {
+          margin: 0;
+          font-size: 2rem;
+          color: #e0cba8;
+        }
+        .board-copy {
+          margin: 0;
+          color: rgba(224, 203, 168, 0.68);
+          max-width: 520px;
+        }
+        .empty-panel {
+          border-radius: 26px;
+          padding: 2.5rem;
+          border: 1px dashed rgba(224, 203, 168, 0.45);
+          background: rgba(119, 159, 161, 0.12);
           text-align: center;
+          color: rgba(224, 203, 168, 0.75);
+          display: grid;
+          gap: 0.6rem;
         }
-        .error-banner.global {
-          background: #ffe9e9;
-          color: #9b1c1c;
-          border: 1px solid #f3b4b4;
-          border-radius: 0.6rem;
-          padding: 0.6rem 0.8rem;
-          margin: 0.5rem 0;
+        .empty-panel h3 {
+          margin: 0;
+          color: #e0cba8;
         }
-        @media (max-width: 980px) {
-          .hero { grid-template-columns: 1fr; }
+        .empty-panel p {
+          margin: 0;
+        }
+        .jobs-grid {
+          display: grid;
+          gap: 1.5rem;
+        }
+        @media (max-width: 720px) {
+          .hero-metrics {
+            grid-template-columns: 1fr;
+          }
         }
       `}</style>
     </>

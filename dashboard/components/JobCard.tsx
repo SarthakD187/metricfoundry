@@ -20,7 +20,7 @@ export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
   const [resultLoading, setResultLoading] = useState(false);
   const [resultError, setResultError] = useState<string | null>(null);
 
-  const statusClass = job.status ? `status ${job.status.toLowerCase()}` : 'status unknown';
+  const statusClass = job.status ? `status-pill ${job.status.toLowerCase()}` : 'status-pill unknown';
 
   const handleToggleManifest = async () => {
     const next = !showManifest;
@@ -58,51 +58,50 @@ export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
   const updated = job.updatedAt ? new Date(job.updatedAt * 1000) : null;
 
   return (
-    <article className="job-card glass-panel">
+    <article className="panel job-card">
       <header className="job-card__header">
-        <div>
-          <p className="eyebrow">Job</p>
-          <h2>{job.jobId}</h2>
+        <div className="job-card__title">
+          <span className="job-chip">{job.sourceType ?? 'Job'}</span>
+          <h3>{job.jobId}</h3>
           <div className="job-meta">
             {created && <span>Created {created.toLocaleString()}</span>}
-            {updated && <span>Last updated {updated.toLocaleString()}</span>}
-            {job.sourceType && <span>Source: {job.sourceType}</span>}
+            {updated && <span>Updated {updated.toLocaleString()}</span>}
           </div>
         </div>
         <div className="job-status-block">
           <span className={statusClass}>{job.status ?? 'Unknown'}</span>
           <div className="job-card__actions">
-            <button type="button" onClick={() => onRefresh?.(job.jobId)}>
+            <button type="button" className="tertiary" onClick={() => onRefresh?.(job.jobId)}>
               Refresh
             </button>
-            <button type="button" onClick={() => onRemove?.(job.jobId)}>
+            <button type="button" className="tertiary" onClick={() => onRemove?.(job.jobId)}>
               Remove
             </button>
           </div>
         </div>
       </header>
 
-      {job.uploadState === 'uploading' && <div className="info-banner">Uploading dataset…</div>}
+      {job.uploadState === 'uploading' && <div className="banner info">Uploading dataset…</div>}
       {job.uploadState === 'uploaded' && (
-        <div className="success-banner subtle">Dataset uploaded. Waiting for processing…</div>
+        <div className="banner success">Dataset uploaded. Waiting for processing…</div>
       )}
-      {job.error && <div className="error-banner">{job.error}</div>}
+      {job.error && <div className="banner danger">{job.error}</div>}
 
       <section className="job-actions">
-        <button type="button" onClick={() => setShowArtifacts((prev) => !prev)}>
+        <button type="button" className="primary" onClick={() => setShowArtifacts((prev) => !prev)}>
           {showArtifacts ? 'Hide artifacts' : 'Browse artifacts'}
         </button>
-        <button type="button" onClick={handleToggleManifest}>
+        <button type="button" className="primary" onClick={handleToggleManifest}>
           {showManifest ? 'Hide manifest' : 'View manifest'}
         </button>
-        <button type="button" onClick={handleFetchResults} disabled={resultLoading}>
+        <button type="button" className="primary" onClick={handleFetchResults} disabled={resultLoading}>
           {resultLoading ? 'Fetching…' : 'Get results link'}
         </button>
       </section>
 
-      {resultError && <div className="error-banner">{resultError}</div>}
+      {resultError && <div className="banner danger">{resultError}</div>}
       {resultUrl && (
-        <div className="success-banner">
+        <div className="banner success">
           <a href={resultUrl} target="_blank" rel="noreferrer">
             Download results
           </a>
@@ -112,7 +111,7 @@ export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
       {showManifest && (
         <section className="manifest-viewer">
           {manifestLoading && <p className="loading">Loading manifest…</p>}
-          {manifestError && <div className="error-banner">{manifestError}</div>}
+          {manifestError && <div className="banner danger">{manifestError}</div>}
           {manifest && !manifestLoading && (
             <ManifestPreview jobId={job.jobId} manifest={manifest} />
           )}
