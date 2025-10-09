@@ -63,13 +63,23 @@ const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL ?? '').replace(/\/$/, '')
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const base = API_BASE || 'http://localhost:8000';
-  const response = await fetch(`${base}${path}`, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers || {}),
-    },
-    ...init,
-  });
+  let response: Response;
+
+  try {
+    response = await fetch(`${base}${path}`, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init?.headers || {}),
+      },
+      ...init,
+    });
+  } catch (error) {
+    const networkMessage =
+      error instanceof TypeError
+        ? `Unable to reach the MetricFoundry API at ${base}. Ensure the backend is running or set NEXT_PUBLIC_API_BASE_URL.`
+        : null;
+    throw new Error(networkMessage ?? (error instanceof Error ? error.message : 'Request failed'));
+  }
 
   if (!response.ok) {
     const payload = await safeJson(response);
