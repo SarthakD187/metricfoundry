@@ -2,88 +2,71 @@
 
 ## Supported dataset ingestion
 
-MetricFoundry's staging Lambda and LangGraph analytics pipeline can now ingest a
-wide range of source formats. Upload CSV, TSV, JSON, JSONL, Excel (`.xls`,
-`.xlsx`, `.xlsm`), and Parquet files directly. Database extracts produced as
-SQLite databases are parsed table-by-table, with binary columns automatically
-base64 encoded for compatibility. Common compression formats including GZIP,
-ZIP, TAR, and TAR.GZ archives are unpacked on the fly so that nested datasets
-are normalised without additional user effort. These capabilities ensure the
-platform accepts virtually any structured dataset for downstream analytics.
+MetricFoundry's staging Lambda and LangGraph analytics pipeline ingest several
+widely used structured data formats out of the box. Delimited text files (CSV
+and TSV), JSON / JSON Lines payloads, Excel workbooks (`.xls`, `.xlsx`,
+`.xlsm`), Parquet files, and SQLite database exports are parsed natively.
+Common archive formats including GZIP, ZIP, TAR, and TAR.GZ are expanded during
+ingest so nested datasets are normalised without extra user effort. Binary
+columns encountered in SQLite tables are automatically base64 encoded to keep
+the downstream processors schema-safe. The pipeline treats common "null"
+sentinels such as empty strings and the tokens `null`, `NULL`, and `NaN` as
+missing values so data quality metrics do not over-count placeholder entries.
+
+These ingestion paths cover most tabular datasets, but truly arbitrary files
+are out of scope. Proprietary binary formats, password-protected archives, and
+multi-terabyte inputs will fail gracefully with surfaced errors so you can
+decide whether to transform the data upstream. When a file cannot be parsed the
+job lands in the `FAILED` state and emits an error artifact detailing the root
+cause.
 
 ### Connector landscape
 
-Jobs are no longer limited to ad-hoc uploads or pre-existing S3 objects. The
-ingestion API accepts rich connector metadata via the `source_config` request
-field, enabling teams to declaratively pull data from almost any system:
+Jobs are staged from S3 objects that you upload or copy into the artifacts
+bucket. The FastAPI surface provides presigned URLs for direct browser uploads
+(`POST /jobs`), and you can also point a job at an existing `s3://bucket/key`
+pair by setting the job's `source` metadata. Additional connectors (HTTP
+endpoints, JDBC databases, and warehouse-native readers) are planned but not
+yet implemented in this repository snapshot.
 
-* **Upload:** generate a presigned URL for direct browser uploads into the
-  artifacts bucket.
-* **S3:** hydrate jobs from objects that already exist in S3 via their URI.
-* **HTTP/S endpoints:** stream payloads from REST endpoints with custom methods,
-  headers, and request bodies before staging them in S3.
-* **Databases:** execute SQL queries against JDBC/SQLAlchemy compatible
-  databases (including SQLite for local extracts) and persist the result set as
-  CSV or JSONL. The API now persists connection metadata under a dedicated
-  `connection` object on each job. Inline URLs use `{ "type": "inline", "url": "..." }`
-  while secure deployments reference AWS Secrets Manager or Systems Manager
-  Parameter Store, for example `{ "type": "secretsManager", "secretArn": "...",
-  "secretField": "url" }`. The staging Lambda resolves these indirections at
-  runtime so credentials never transit the API payload.
-* **Warehouses:** target Snowflake, Redshift, BigQuery, or Databricks using the
-  same SQL workflow, producing staged artifacts tagged with warehouse metadata
-  for downstream observability. Warehouse connectors share the same connection
-  schema, letting teams centralise credential management across both OLTP and
-  analytical systems.
+## Analytics pipeline
 
-This connector catalogue underpins the platform's "any dataset" promise while
-keeping the job orchestration API consistent for every source type.
+Once a job is staged, invoking `POST /jobs/{jobId}/process` streams the real
+LangGraph analytics pipeline instead of placeholder outputs. The handler loads
+the staged object from S3, routes it through the pipeline phases, and
+persistent artifacts and manifests to `artifacts/{jobId}/`. Every phase update
+is pushed back into DynamoDB so the dashboard and API clients can display live
+progress. When the pipeline finishes, genuine descriptive statistics,
+correlations, outlier diagnostics, inference hints, and rendered visualisations
+are bundled into `results.json` for downstream consumption.
 
-## Scalability & workflow resilience
-
-Large ingestion jobs now benefit from more generous Lambda resource profiles:
-the staging function has a 10-minute timeout with 2 GB of memory, while the
-analytics processor runs for up to 15 minutes with 4 GB available. These
-headroom increases allow bigger files and more complex enrichment logic to
-complete without falling back to retries.
+The pipeline is defensive against messy data: schema inference treats zero-only
+columns and sparsely populated fields as categorical, metrics such as dataset
+completeness exclude recognised null sentinels, and quantile / standard
+deviation calculations use numerically stable streaming algorithms. Extremely
+large files may still exceed the Lambda's available memory or timeout budget,
+but those cases surface explicit failure events and error artifacts so you can
+iterate safely.
 
 ## API hardening & observability
 
-The FastAPI service that fronts the ingestion workflow now exposes endpoints
-for rich status introspection and artifact browsing:
+The FastAPI service fronts the ingestion workflow and exposes endpoints for
+status introspection and artifact browsing:
 
-* `GET /jobs/{jobId}` – returns job status, timestamps, result key metadata and
+* `GET /jobs/{jobId}` – returns job status, timestamps, result key metadata, and
   source information.
 * `GET /jobs/{jobId}/manifest` – fetches the manifest JSON captured during
-  ingestion for quick inspection.
-* `GET /jobs/{jobId}/artifacts` – lists any objects stored under the job's
-  artifact prefix with optional pagination and hierarchical filtering.
+  ingestion for inspection.
+* `GET /jobs/{jobId}/artifacts` – lists objects stored under the job's artifact
+  prefix with optional pagination and hierarchical filtering.
 * `GET /jobs/{jobId}/results/files` – enumerates published result files beneath
   `artifacts/{jobId}/results/`.
 * `GET /jobs/{jobId}/results` – issues a signed download URL for either the
   default `results.json` or any specific result file path.
 
-Each request is wrapped with structured logging and emits CloudWatch metrics
-for successful and failed job submissions, ensuring production visibility into
+Each request is wrapped with structured logging and emits CloudWatch-style
+metrics for successful and failed job submissions, giving visibility into
 latency, validation failures, and workflow launches.
-
-### Automated testing
-
-Python unit tests cover the job lifecycle, manifest/result discovery, and API
-validation logic. Run them locally with:
-
-```bash
-pip install -r services/api/requirements-dev.txt
-pytest services/api/tests
-```
-
-Additional integration suites exercise the public API and workflow orchestration
-end-to-end, covering job creation, Step Functions launches, artifact discovery,
-and result downloads:
-
-```bash
-pytest tests/integration/test_api_workflow.py
-```
 
 ## Web dashboard
 

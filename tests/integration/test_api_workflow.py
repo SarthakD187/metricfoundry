@@ -1,15 +1,18 @@
 import asyncio
 import importlib
+import io
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional
 
 import httpx
 import pytest
 from botocore.exceptions import ClientError
 
+from tests.integration.utils.langgraph import ensure_langgraph_stub
 
 def _client_error(code: str, operation: str) -> ClientError:
     return ClientError({"Error": {"Code": code, "Message": code}}, operation)
@@ -152,6 +155,14 @@ class FakeS3:
             "ETag": metadata.get("ETag"),
         }
 
+    def get_object(self, Bucket: str, Key: str):
+        bucket = self._bucket(Bucket)
+        if Key not in bucket:
+            raise _client_error("404", "GetObject")
+        metadata = bucket[Key]
+        body = io.BytesIO(metadata.get("Body", b""))
+        return {"Body": body, "ContentLength": metadata.get("Size")}
+
 
 class ApiClient:
     def __init__(self, app):
@@ -176,6 +187,7 @@ class ApiClient:
 
 @pytest.fixture()
 def api_app(monkeypatch):
+    ensure_langgraph_stub()
     monkeypatch.setenv("BUCKET_NAME", "artifacts-bucket")
     monkeypatch.setenv("TABLE_NAME", "jobs-table")
     monkeypatch.setenv("STATE_MACHINE_ARN", "arn:aws:states:region:acct:stateMachine:jobs")
@@ -194,6 +206,54 @@ def api_app(monkeypatch):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     module = importlib.import_module("services.api.app")
     importlib.reload(module)
+
+    graph_module = importlib.import_module("services.workers.graph.graph")
+    stub_phase_order = ["ingest", "profile", "descriptive_stats", "nl_report", "finalize"]
+
+    def _stub_run_pipeline(job_id, source, body, *, artifact_prefix, on_phase=None):
+        phases = {
+            "ingest": {"summary": "ingested", "rows": 2, "sourceFormat": "csv"},
+            "profile": {"columnProfiles": [{"name": "value", "inferredType": "integer"}]},
+            "descriptive_stats": {"metrics": {"rows": 2}},
+            "nl_report": {"summary": "Report"},
+            "finalize": {"summary": "done"},
+        }
+        if on_phase:
+            for index, phase in enumerate(stub_phase_order):
+                on_phase(phase, phases.get(phase, {}), index, len(stub_phase_order))
+
+        artifact_contents = {
+            "results/descriptive_stats.csv": {
+                "kind": "csv",
+                "headers": ["column", "count"],
+                "rows": [{"column": "value", "count": 2}],
+            },
+            "results/report.txt": {"kind": "text", "text": "analysis"},
+            "results/report.html": {"kind": "html", "html": "<p>analysis</p>"},
+            "results/bundles/analytics_bundle.zip": {"kind": "binary", "data": b"bundle"},
+            "results/bundles/visualizations.zip": {"kind": "binary", "data": b"viz"},
+        }
+
+        manifest = {
+            "jobId": job_id,
+            "artifacts": [
+                {"key": f"{artifact_prefix}/results/results.json"},
+                {"key": f"{artifact_prefix}/results/manifest.json"},
+            ],
+        }
+
+        return SimpleNamespace(
+            phases=phases,
+            metrics={"rows": 2, "columns": 1, "bytesRead": 20},
+            manifest=manifest,
+            artifact_contents=artifact_contents,
+            correlations=[],
+            outliers=[],
+            ml_inference={"status": "skipped"},
+        )
+
+    monkeypatch.setattr(graph_module, "PHASE_ORDER", stub_phase_order)
+    monkeypatch.setattr(graph_module, "run_pipeline", _stub_run_pipeline)
 
     fake_s3 = FakeS3()
     fake_table = FakeTable()
@@ -304,3 +364,55 @@ def test_artifact_and_results_endpoints(api_app):
     download_body = download.json()
     assert download_body["key"].endswith("results.json")
     assert download_body["downloadUrl"].startswith("https://example.com/")
+
+
+def test_process_now_runs_pipeline(api_app):
+    client, module, s3, table, _sfn, cloudwatch = api_app
+
+    job_id = "job-process"
+    source_bucket = "incoming"
+    source_key = "uploads/data.csv"
+
+    table.put_item(
+        {
+            "pk": f"job#{job_id}",
+            "sk": "meta",
+            "status": "QUEUED",
+            "createdAt": 1700000100,
+            "updatedAt": 1700000100,
+            "source": {"type": "upload", "bucket": source_bucket, "key": source_key},
+        }
+    )
+
+    s3.put_object(
+        Bucket=source_bucket,
+        Key=source_key,
+        Body="id,value\n1,2\n2,3\n",
+        ContentType="text/csv",
+    )
+
+    response = client.post(f"/jobs/{job_id}/process")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["jobId"] == job_id
+    assert body["resultKey"].endswith("results/results.json")
+    assert body["manifestKey"].endswith("results/manifest.json")
+
+    record = table._items[(f"job#{job_id}", "meta")]
+    assert record["status"] == "SUCCEEDED"
+    assert record["resultKey"] == body["resultKey"]
+    assert record["manifestKey"] == body["manifestKey"]
+
+    artifacts_bucket = module.BUCKET_NAME
+    artifact_keys = sorted(s3._objects.get(artifacts_bucket, {}).keys())
+    assert f"artifacts/{job_id}/phases/ingest.json" in artifact_keys
+    assert body["resultKey"] in artifact_keys
+    assert f"artifacts/{job_id}/results/bundles/analytics_bundle.zip" in artifact_keys
+
+    results_payload = body["results"]
+    assert results_payload["metrics"]["rows"] == 2
+    assert results_payload["summary"]["columns"] == 1
+    assert results_payload["links"]["resultsJson"].endswith("results/results.json")
+
+    metric_names = [metric["MetricName"] for metric in cloudwatch.metrics]
+    assert "JobProcessed" in metric_names
