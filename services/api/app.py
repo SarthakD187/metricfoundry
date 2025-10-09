@@ -1,17 +1,20 @@
 # services/api/app.py
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import time
 import uuid
+import zipfile
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import boto3
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 from pydantic import BaseModel
 
@@ -35,10 +38,7 @@ table = ddb.Table(TABLE_NAME)
 sfn = boto3.client("stepfunctions")
 cloudwatch = boto3.client("cloudwatch")
 
-app = FastAPI(title="MetricFoundry API")
-
-from fastapi.middleware.cors import CORSMiddleware
-
+# ---- App ----
 app = FastAPI(title="MetricFoundry API")
 
 # --- CORS for local dashboard ---
@@ -49,22 +49,14 @@ app.add_middleware(
         "http://127.0.0.1:3000",
     ],
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],      # allow Content-Type, etc.
-    expose_headers=["*"],     # surface x-request-id, ETag, etc.
-    allow_credentials=False,  # set True only if you actually use cookies/auth headers
+    allow_headers=["*"],
+    expose_headers=["*"],
+    allow_credentials=False,
 )
 
 # ---- Models ----
 class CreateJob(BaseModel):
-    """Request payload for job creation.
-
-    ``source_type`` determines which connector will be used.  Historically the
-    API only accepted ``upload`` and ``s3`` jobs – we now expose a ``source_config``
-    payload so that richer connectors (HTTP endpoints, databases, data
-    warehouses, etc.) can pass the metadata they need without changing the core
-    contract for existing clients.
-    """
-
+    """Request payload for job creation."""
     source_type: str
     s3_path: str | None = None
     source_config: Dict[str, object] | None = None
@@ -76,7 +68,6 @@ def _clean_config(config: Dict[str, object] | None) -> Dict[str, object]:
 
 def _build_sql_connection(config: Dict[str, object], *, source_label: str) -> Dict[str, object]:
     """Normalise SQL connection metadata for databases and warehouses."""
-
     connection_meta = config.get("connection")
     secret_field = config.get("secretField")
 
@@ -135,26 +126,17 @@ def _build_sql_connection(config: Dict[str, object], *, source_label: str) -> Di
 
     if url:
         return {"type": "inline", "url": url}
-
     if secret_arn:
         payload = {"type": "secretsManager", "secretArn": secret_arn}
     else:
         payload = {"type": "parameterStore", "parameterName": parameter_name}
-
     if secret_field:
         payload["secretField"] = secret_field
-
     return payload
 
 
-def _build_source(body: CreateJob, job_id: str) -> tuple[dict, Optional[str]]:
-    """Normalise the user's request into an internal ``source`` descriptor.
-
-    Returns a tuple of ``(source_metadata, upload_url)`` where the latter is only
-    populated for ``upload`` workflows that expect the client to PUT data
-    directly to S3.
-    """
-
+def _build_source(body: CreateJob, job_id: str) -> Tuple[dict, Optional[str]]:
+    """Return (source_metadata, upload_url?)."""
     source_type = body.source_type
     config = _clean_config(body.source_config)
 
@@ -234,17 +216,12 @@ def _build_source(body: CreateJob, job_id: str) -> tuple[dict, Optional[str]]:
 
 # ---- Helpers ----
 def record_metric(name: str, value: float = 1, unit: str = "Count", dimensions: Optional[Dict[str, str]] | None = None) -> None:
-    metric = {
-        "MetricName": name,
-        "Value": value,
-        "Unit": unit,
-    }
+    metric = {"MetricName": name, "Value": value, "Unit": unit}
     if dimensions:
         metric["Dimensions"] = [{"Name": key, "Value": val} for key, val in dimensions.items()]
-
     try:
         cloudwatch.put_metric_data(Namespace=METRICS_NAMESPACE, MetricData=[metric])
-    except Exception as exc:  # pragma: no cover - observability must never block requests
+    except Exception as exc:  # pragma: no cover
         logger.debug("failed to emit metric", extra={"metric": name, "error": str(exc)})
 
 
@@ -256,15 +233,12 @@ def ddb_put_job(job_id: str, status: str, source: dict, created: int):
     item = {
         "pk": f"job#{job_id}",
         "sk": "meta",
-        "status": status,      # CREATED -> (worker sets RUNNING/SUCCEEDED/FAILED)
+        "status": status,
         "createdAt": created,
         "updatedAt": created,
         "source": source,
     }
-    table.put_item(
-        Item=item,
-        ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)"
-    )
+    table.put_item(Item=item, ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)")
     return item
 
 
@@ -319,16 +293,9 @@ def serialize_objects(objects: Iterable[dict]) -> List[dict]:
 
 
 def _normalize_s3_path(value: str) -> str:
-    """Return a canonical representation of an S3 key or prefix.
-
-    S3 treats keys as POSIX-like paths.  This helper collapses ``.`` and ``..``
-    segments so callers can safely compare prefixes without being tricked by
-    directory traversal payloads like ``artifacts/{job}/../other``.
-    """
-
+    """Return a canonical representation of an S3 key or prefix."""
     if value == "":
         return value
-
     segments: List[str] = []
     for segment in value.split("/"):
         if segment in ("", "."):
@@ -338,7 +305,6 @@ def _normalize_s3_path(value: str) -> str:
                 segments.pop()
             continue
         segments.append(segment)
-
     normalised = "/".join(segments)
     if value.endswith("/") and normalised:
         normalised += "/"
@@ -349,13 +315,10 @@ def validate_prefix(job_id: str, prefix: Optional[str], *, base: str) -> str:
     target = prefix or base
     base_normalised = _normalize_s3_path(base)
     target_normalised = _normalize_s3_path(target)
-
     base_compare = base_normalised.rstrip("/")
     target_compare = target_normalised.rstrip("/")
-
     if target_compare != base_compare and not target_compare.startswith(f"{base_compare}/"):
         raise HTTPException(status_code=400, detail="prefix must target this job's artifacts")
-
     if target_compare == base_compare:
         return base_normalised
     return target_normalised
@@ -369,6 +332,7 @@ def ddb_item_to_job(job_id: str, item: dict) -> dict:
         "updatedAt": item.get("updatedAt"),
         "resultKey": item.get("resultKey"),
         "source": item.get("source"),
+        "error": item.get("error"),
     }
 
 
@@ -376,6 +340,7 @@ def ddb_item_to_job(job_id: str, item: dict) -> dict:
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.post("/jobs")
 def create_job(body: CreateJob):
@@ -388,7 +353,7 @@ def create_job(body: CreateJob):
     except HTTPException:
         record_metric("JobValidationError", dimensions=dimensions)
         raise
-    except Exception as exc:  # pragma: no cover - defensive guard
+    except Exception as exc:  # pragma: no cover
         record_metric("JobValidationError", dimensions=dimensions)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -405,6 +370,7 @@ def create_job(body: CreateJob):
     execution_name = f"job-{job_id}".replace("/", "-")
 
     try:
+        # Start the workflow (can be disabled in local dev if desired)
         sfn.start_execution(
             stateMachineArn=STATE_MACHINE_ARN,
             name=execution_name,
@@ -427,7 +393,8 @@ def create_job(body: CreateJob):
 
     record_metric("JobCreated", dimensions=dimensions)
     logger.info("job queued", extra={"job_id": job_id, **dimensions})
-    return {"jobId": job_id, "uploadUrl": upload_url}
+    return {"jobId": job_id, "uploadUrl": upload_url, "source": source}
+
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
@@ -531,6 +498,9 @@ def list_job_result_files(
 
 @app.get("/jobs/{job_id}/results")
 def get_job_results(job_id: str, path: Optional[str] = Query(default=None, description="Relative path within the job's results directory")):
+    """Return a presigned download URL for a results file.
+    Defaults to artifacts/{job_id}/results/results.json
+    """
     ensure_job(job_id)
     prefix = _normalize_s3_path(f"artifacts/{job_id}/results/")
     relative = path.lstrip("/") if path else "results.json"
@@ -554,6 +524,305 @@ def get_job_results(job_id: str, path: Optional[str] = Query(default=None, descr
         ExpiresIn=600,
     )
     return {"jobId": job_id, "downloadUrl": url, "key": key}
+
+
+@app.get("/jobs/{job_id}/download")
+def presign_any(job_id: str, key: str = Query(..., description="Full S3 key inside artifacts/{job_id}/...")):
+    ensure_job(job_id)
+    base_prefix = f"artifacts/{job_id}/"
+    norm = _normalize_s3_path(key)
+    if not norm.startswith(base_prefix):
+        raise HTTPException(status_code=400, detail="key must be within artifacts/{job_id}/")
+    try:
+        s3.head_object(Bucket=BUCKET_NAME, Key=norm)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code in ("404", "NotFound", "NoSuchKey"):
+            raise HTTPException(status_code=404, detail="Object not found")
+        raise HTTPException(status_code=502, detail="Unable to verify object")
+    url = s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": BUCKET_NAME, "Key": norm},
+        ExpiresIn=600,
+    )
+    return {"jobId": job_id, "downloadUrl": url, "key": norm}
+
+
+# --- Dev/manual processing endpoint to emit the full artifact layout ---
+@app.post("/jobs/{job_id}/process")
+def process_now(job_id: str):
+    """
+    Emits the structure described in the Result Package Overview:
+
+    artifacts/{jobId}/
+      manifest.json
+      phases/
+        01_ingest.json
+        02_profiling.json
+        03_quality.json
+        04_descriptives.json
+        05_narrative.json
+        99_finalize.json
+      results/
+        results.json
+        manifest.json
+        descriptive_stats.csv
+        descriptiveTable.json
+        correlations.csv
+        outliers.json
+        report.html
+        report.txt
+        graphs/
+          hist_1.png
+          scatter_1.png
+        bundles/
+          analytics_bundle.zip
+          visualizations.zip
+    """
+    job = ensure_job(job_id)
+    src = job.get("source") or {}
+    bucket = src.get("bucket")
+    key    = src.get("key")
+    if not (bucket and key):
+        raise HTTPException(status_code=400, detail="job has no source.bucket/key")
+
+    ddb_update_status(job_id, "RUNNING")
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    try:
+        # --- Read input to compute basic stats (demo) ---
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        body_stream = obj["Body"]
+        line_count = 0
+        data_bytes = 0
+        for chunk in iter(lambda: body_stream.read(1024 * 1024), b""):
+            line_count += chunk.count(b"\n")
+            data_bytes += len(chunk)
+        if data_bytes > 0:
+            line_count = max(1, line_count)
+        rows = max(0, line_count - 1)
+        columns = 2  # demo; a real pipeline should infer
+
+        base = f"artifacts/{job_id}"
+
+        # --- Phase files ---
+        phases = [
+            ("01_ingest.json", {
+                "phase": "ingest",
+                "input": {"bucket": bucket, "key": key, "bytes": data_bytes},
+                "status": "completed", "at": now_iso,
+            }),
+            ("02_profiling.json", {
+                "phase": "profiling",
+                "summary": {"rows": rows, "columns": columns},
+                "status": "completed", "at": now_iso,
+            }),
+            ("03_quality.json", {
+                "phase": "data_quality",
+                "checks": [{"name": "non_empty", "status": "pass"}],
+                "status": "completed", "at": now_iso,
+            }),
+            ("04_descriptives.json", {
+                "phase": "descriptive_stats",
+                "tables": [{"name": "descriptive_stats", "path": f"s3://{BUCKET_NAME}/{base}/results/descriptive_stats.csv"}],
+                "status": "completed", "at": now_iso,
+            }),
+            ("05_narrative.json", {
+                "phase": "nl_report",
+                "highlights": [
+                    f"Dataset has {rows} rows and {columns} columns.",
+                    "Strongest correlations and potential outliers summarized in report.",
+                ],
+                "status": "completed", "at": now_iso,
+            }),
+            ("99_finalize.json", {"phase": "finalization", "status": "completed", "at": now_iso}),
+        ]
+        for fname, payload in phases:
+            s3.put_object(
+                Bucket=BUCKET_NAME,
+                Key=f"{base}/phases/{fname}",
+                Body=json.dumps(payload, indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
+
+        # --- Top-level manifest (dev/debug) ---
+        manifest = {
+            "jobId": job_id,
+            "generatedAt": now_iso,
+            "input": {"bucket": bucket, "key": key, "bytes": data_bytes},
+            "phases": [f"s3://{BUCKET_NAME}/{base}/phases/{n}" for (n, _) in phases],
+        }
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=f"{base}/manifest.json",
+            Body=json.dumps(manifest, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+
+        # --- Results: descriptive_stats.csv (demo single-row per column) ---
+        desc_csv = [
+            "column,count,mean,std,min,p5,p25,p50,p75,p95,max",
+            "a,100,50.0,10.0,10,20,40,50,60,80,90",
+            "b,100,25.0,5.0,5,10,20,25,30,40,45",
+        ]
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=f"{base}/results/descriptive_stats.csv",
+            Body=("\n".join(desc_csv) + "\n").encode("utf-8"),
+            ContentType="text/csv",
+        )
+        # JSON version for in-app rendering convenience
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=f"{base}/results/descriptiveTable.json",
+            Body=json.dumps({
+                "columns": ["column","count","mean","std","min","p5","p25","p50","p75","p95","max"],
+                "rows": [
+                    {"column":"a","count":100,"mean":50.0,"std":10.0,"min":10,"p5":20,"p25":40,"p50":50,"p75":60,"p95":80,"max":90},
+                    {"column":"b","count":100,"mean":25.0,"std":5.0,"min":5,"p5":10,"p25":20,"p50":25,"p75":30,"p95":40,"max":45},
+                ]
+            }, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+
+        # --- Results: correlations.csv ---
+        corr_csv = [
+            "feature_x,feature_y,pearson_r,n",
+            "a,b,0.71,100",
+        ]
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=f"{base}/results/correlations.csv",
+            Body=("\n".join(corr_csv) + "\n").encode("utf-8"),
+            ContentType="text/csv",
+        )
+
+        # --- Results: outliers.json (z-score demo) ---
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=f"{base}/results/outliers.json",
+            Body=json.dumps({
+                "method":"zscore","threshold":3.0,
+                "findings":[
+                    {"column":"a","value":90,"z":3.2,"index":92},
+                    {"column":"b","value":45,"z":3.1,"index":77},
+                ]
+            }, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+
+        # --- Report (HTML + TXT) ---
+        html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>MetricFoundry Report</title>
+<style>body{{font-family:ui-sans-serif,system-ui;max-width:920px;margin:24px auto;padding:0 16px}}
+h1{{font-size:22px}} .kpi{{display:inline-block;margin-right:16px;padding:8px 12px;border:1px solid #ddd;border-radius:10px}}</style></head>
+<body>
+  <h1>Descriptive report — Job {job_id}</h1>
+  <div class="kpi">Rows: <b>{rows}</b></div>
+  <div class="kpi">Columns: <b>{columns}</b></div>
+  <p>Generated: {now_iso}</p>
+  <p><b>Highlights:</b> strongest correlation a↔b (r≈0.71); 2 potential outliers found (z≥3).</p>
+</body></html>"""
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=f"{base}/results/report.html",
+            Body=html.encode("utf-8"),
+            ContentType="text/html",
+        )
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=f"{base}/results/report.txt",
+            Body=f"Job {job_id}\nRows: {rows}\nColumns: {columns}\nGenerated: {now_iso}\n".encode("utf-8"),
+            ContentType="text/plain",
+        )
+
+        # --- Graphs (PNG stubs) ---
+        png_stub = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x05\x00\x00\x00\x05\x08\x06\x00\x00\x00\x8d\x89\x1d\r\x00\x00\x00\x0cIDATx\x9ccddbf\xa0\x040\x00\x00\x05\x00\x01\x9b\xc7\x19\xd3\x00\x00\x00\x00IEND\xaeB`\x82"
+        s3.put_object(Bucket=BUCKET_NAME, Key=f"{base}/results/graphs/hist_1.png", Body=png_stub, ContentType="image/png")
+        s3.put_object(Bucket=BUCKET_NAME, Key=f"{base}/results/graphs/scatter_1.png", Body=png_stub, ContentType="image/png")
+
+        # --- Results manifest (enumerate user-facing deliverables) ---
+        results_manifest = {
+            "jobId": job_id,
+            "generatedAt": now_iso,
+            "artifacts": [
+                {"key": f"{base}/results/descriptive_stats.csv", "contentType":"text/csv"},
+                {"key": f"{base}/results/descriptiveTable.json", "contentType":"application/json"},
+                {"key": f"{base}/results/correlations.csv", "contentType":"text/csv"},
+                {"key": f"{base}/results/outliers.json", "contentType":"application/json"},
+                {"key": f"{base}/results/report.html", "contentType":"text/html"},
+                {"key": f"{base}/results/report.txt", "contentType":"text/plain"},
+                {"key": f"{base}/results/graphs/hist_1.png", "contentType":"image/png"},
+                {"key": f"{base}/results/graphs/scatter_1.png", "contentType":"image/png"},
+            ]
+        }
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=f"{base}/results/manifest.json",
+            Body=json.dumps(results_manifest, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+
+        # --- results.json (canonical API summary) ---
+        results_json = {
+            "jobId": job_id,
+            "summary": {"rows": rows, "columns": columns},
+            "links": {
+                "manifest": f"s3://{BUCKET_NAME}/{base}/manifest.json",
+                "resultsManifest": f"s3://{BUCKET_NAME}/{base}/results/manifest.json",
+                "input": f"s3://{bucket}/{key}",
+                "reportHtml": f"s3://{BUCKET_NAME}/{base}/results/report.html",
+            },
+            "generatedAt": now_iso,
+        }
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=f"{base}/results/results.json",
+            Body=json.dumps(results_json, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+
+        # --- Bundles (analytics + visualizations) ---
+        # analytics_bundle.zip: CSV/JSON diagnostics
+        mem = io.BytesIO()
+        with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("descriptive_stats.csv", "\n".join(desc_csv) + "\n")
+            zf.writestr("correlations.csv", "\n".join(corr_csv) + "\n")
+            zf.writestr("outliers.json", json.dumps({
+                "method":"zscore","threshold":3.0,"findings":[
+                    {"column":"a","value":90,"z":3.2,"index":92},
+                    {"column":"b","value":45,"z":3.1,"index":77},
+                ]
+            }, indent=2))
+        mem.seek(0)
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=f"{base}/results/bundles/analytics_bundle.zip",
+            Body=mem.read(),
+            ContentType="application/zip",
+        )
+
+        # visualizations.zip: PNG graphs
+        mem2 = io.BytesIO()
+        with zipfile.ZipFile(mem2, mode="w", compression=zipfile.ZIP_DEFLATED) as zf2:
+            zf2.writestr("graphs/hist_1.png", png_stub)
+            zf2.writestr("graphs/scatter_1.png", png_stub)
+        mem2.seek(0)
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=f"{base}/results/bundles/visualizations.zip",
+            Body=mem2.read(),
+            ContentType="application/zip",
+        )
+
+        # success
+        results_key = f"{base}/results/results.json"
+        ddb_update_status(job_id, "SUCCEEDED", resultKey=results_key)
+        return {"ok": True, "resultKey": results_key}
+    except Exception as e:
+        ddb_update_status(job_id, "FAILED", error=str(e)[:1000])
+        raise
+
 
 # ---- Middleware ----
 @app.middleware("http")
@@ -591,4 +860,3 @@ async def log_requests(request: Request, call_next):
 
 # ✅ GLOBAL Lambda handler (must be at module scope)
 handler = Mangum(app)
-

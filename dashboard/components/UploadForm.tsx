@@ -1,152 +1,171 @@
-import { FormEvent, useState } from 'react';
-import { createS3Job, createUploadJob } from '../lib/api';
+// dashboard/components/UploadForm.tsx
+// Drop-in replacement that works with the new index.tsx contract.
+// It asks the parent for { jobId, upload(file) } and handles file selection/drag-drop.
 
-interface UploadFormProps {
-  onJobCreated: (jobId: string, metadata: { sourceType: string }) => void;
-  onUploadFinished?: (jobId: string) => void;
+import React, { useCallback, useRef, useState } from "react";
+
+type OnJobCreated = () => Promise<{
+  jobId: string;
+  upload: (file: File | Blob) => Promise<void>;
+}>;
+
+export default function UploadForm({
+  onJobCreated,
+  onError,
+}: {
+  onJobCreated: OnJobCreated;
   onError?: (message: string) => void;
-}
+}) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const [busy, setBusy] = useState<false | "creating" | "uploading" | "done">(
+    false,
+  );
+  const [localMsg, setLocalMsg] = useState<string>("");
 
-export function UploadForm({ onJobCreated, onUploadFinished, onError }: UploadFormProps) {
-  const [mode, setMode] = useState<'upload' | 's3'>('upload');
-  const [file, setFile] = useState<File | null>(null);
-  const [s3Path, setS3Path] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [status, setStatus] = useState<string | null>(null);
+  const pickFile = useCallback(() => inputRef.current?.click(), []);
 
-  const reset = () => {
-    setFile(null);
-    setS3Path('');
-    if (typeof window !== 'undefined') {
-      const input = document.getElementById('dataset-file-input');
-      if (input instanceof HTMLInputElement) {
-        input.value = '';
+  const handleFiles = useCallback(
+    async (files: FileList | null) => {
+      if (!files || !files[0]) return;
+      const file = files[0];
+
+      try {
+        setBusy("creating");
+        setLocalMsg("Creating job…");
+        const { upload } = await onJobCreated();
+
+        setBusy("uploading");
+        setLocalMsg("Uploading dataset…");
+        await upload(file);
+
+        setBusy("done");
+        setLocalMsg("Upload complete. Processing…");
+      } catch (e) {
+        const msg =
+          e instanceof Error ? e.message : "Failed to upload and start processing";
+        onError?.(msg);
+        setBusy(false);
+        setLocalMsg("");
       }
-    }
-  };
+    },
+    [onJobCreated, onError],
+  );
 
-  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    setStatus(null);
+  const onInputChange = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      await handleFiles(e.target.files);
+      // clear input so selecting the same file again still triggers change
+      if (inputRef.current) inputRef.current.value = "";
+    },
+    [handleFiles],
+  );
 
-    try {
-      setSubmitting(true);
-      if (mode === 'upload') {
-        if (!file) {
-          throw new Error('Please choose a dataset to upload.');
-        }
-        setStatus('Creating job…');
-        const response = await createUploadJob();
-        onJobCreated(response.jobId, { sourceType: 'upload' });
+  const onDrop = useCallback(
+    async (e: React.DragEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+      await handleFiles(e.dataTransfer.files);
+    },
+    [handleFiles],
+  );
 
-        if (!response.uploadUrl) {
-          throw new Error('Upload URL was not returned by the API.');
-        }
-
-        setStatus('Uploading dataset…');
-        const uploadResponse = await fetch(response.uploadUrl, {
-          method: 'PUT',
-          headers: {
-            'Content-Type': file.type || 'text/csv',
-          },
-          body: file,
-        });
-
-        if (!uploadResponse.ok) {
-          throw new Error(`Upload failed with status ${uploadResponse.status}.`);
-        }
-
-        setStatus('Upload complete! Your job has been queued.');
-        onUploadFinished?.(response.jobId);
-        reset();
-        return;
-      }
-
-      if (!s3Path.trim()) {
-        throw new Error('Please provide an s3:// bucket path.');
-      }
-
-      setStatus('Creating job…');
-      const response = await createS3Job(s3Path.trim());
-      onJobCreated(response.jobId, { sourceType: 's3' });
-      setStatus('Job created! We will poll the status automatically.');
-      reset();
-    } catch (error) {
-      console.error('Failed to create job', error);
-      const message = error instanceof Error ? error.message : 'Unexpected error creating job';
-      setStatus(message);
-      onError?.(message);
-    } finally {
-      setSubmitting(false);
-    }
+  const prevent = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
   };
 
   return (
-    <form className="glass-panel" onSubmit={handleSubmit}>
-      <div className="panel-header">
-        <div>
-          <p className="eyebrow">Create a job</p>
-          <h2>Ingest a new dataset</h2>
-          <p className="subtitle">
-            Upload a CSV or point to an existing S3 object. We will automatically monitor the job and surface
-            the outputs once processing completes.
-          </p>
-        </div>
-        <div className="mode-toggle" role="group" aria-label="Dataset source">
-          <button
-            type="button"
-            className={mode === 'upload' ? 'active' : ''}
-            onClick={() => setMode('upload')}
-          >
-            Direct upload
-          </button>
-          <button type="button" className={mode === 's3' ? 'active' : ''} onClick={() => setMode('s3')}>
-            S3 reference
-          </button>
-        </div>
+    <div className="glass-panel uploader">
+      <p className="eyebrow">Upload</p>
+      <h2>New dataset</h2>
+      <p className="subtitle">
+        Drop a CSV here and we’ll upload it, kick off processing, and render a user-friendly analysis.
+      </p>
+
+      <div
+        className={`dropzone ${busy ? "disabled" : ""}`}
+        onClick={busy ? undefined : pickFile}
+        onDrop={busy ? undefined : onDrop}
+        onDragOver={busy ? undefined : prevent}
+        onDragEnter={busy ? undefined : prevent}
+        onDragLeave={busy ? undefined : prevent}
+        role="button"
+        aria-disabled={!!busy}
+      >
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".csv,text/csv"
+          className="hidden"
+          onChange={onInputChange}
+        />
+        {!busy && (
+          <>
+            <div className="dz-title">Drag & drop a CSV</div>
+            <div className="dz-sub">or click to choose a file</div>
+          </>
+        )}
+        {busy && (
+          <div className="dz-status">
+            <span className="spinner" aria-hidden />
+            <span>{localMsg}</span>
+          </div>
+        )}
       </div>
 
-      {mode === 'upload' ? (
-        <div className="form-grid">
-          <label className="field">
-            <span>Select dataset</span>
-            <input
-              id="dataset-file-input"
-              type="file"
-              accept=".csv,text/csv"
-              onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-            />
-          </label>
-          <p className="field-hint">
-            Files are uploaded securely using a presigned URL that is valid for 15 minutes. Maximum size depends on your
-            S3 bucket configuration.
-          </p>
-        </div>
-      ) : (
-        <div className="form-grid">
-          <label className="field">
-            <span>S3 object URI</span>
-            <input
-              type="text"
-              placeholder="s3://my-bucket/path/to/object.csv"
-              value={s3Path}
-              onChange={(event) => setS3Path(event.target.value)}
-            />
-          </label>
-          <p className="field-hint">
-            Provide the fully-qualified path to the object you would like MetricFoundry to process.
-          </p>
-        </div>
-      )}
-
-      <div className="form-actions">
-        <button type="submit" disabled={submitting}>
-          {submitting ? 'Working…' : mode === 'upload' ? 'Upload & queue job' : 'Queue job'}
-        </button>
-        {status && <span className="status-message">{status}</span>}
-      </div>
-    </form>
+      <style jsx>{`
+        .uploader {
+          display: grid;
+          gap: 0.6rem;
+        }
+        .dropzone {
+          border: 2px dashed rgba(0, 0, 0, 0.2);
+          border-radius: 1rem;
+          padding: 1.25rem;
+          text-align: center;
+          cursor: pointer;
+          background: #fff;
+        }
+        .dropzone:hover {
+          background: #fafafa;
+        }
+        .dropzone.disabled {
+          opacity: 0.7;
+          cursor: not-allowed;
+        }
+        .dz-title {
+          font-size: 1.05rem;
+          font-weight: 600;
+        }
+        .dz-sub {
+          font-size: 0.9rem;
+          opacity: 0.7;
+        }
+        .dz-status {
+          display: inline-flex;
+          gap: 0.6rem;
+          align-items: center;
+          justify-content: center;
+          font-size: 0.95rem;
+        }
+        .spinner {
+          width: 16px;
+          height: 16px;
+          border-radius: 50%;
+          border: 2px solid #000;
+          border-top-color: transparent;
+          display: inline-block;
+          animation: spin 0.9s linear infinite;
+        }
+        @keyframes spin {
+          to {
+            transform: rotate(360deg);
+          }
+        }
+        .hidden {
+          display: none;
+        }
+      `}</style>
+    </div>
   );
 }
-
-export default UploadForm;
