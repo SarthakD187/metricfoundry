@@ -131,6 +131,8 @@ def test_stage_and_processor_pipeline(
 
     stage_result = stage_module.handler({"jobId": job_id}, None)
     assert stage_result["metadata"]["format"] == expected_format
+    staged_bucket = stage_result["input"]["bucket"]
+    staged_key = stage_result["input"]["key"]
 
     if patch_parquet:
         graph_module = importlib.import_module("services.workers.graph.graph")
@@ -157,6 +159,14 @@ def test_stage_and_processor_pipeline(
     assert results_payload["metrics"]["rows"] == len(SAMPLE_ROWS)
     assert results_payload["metrics"]["columns"] == len(SAMPLE_ROWS[0])
     assert results_payload["mlInference"]["status"] in {"failed", "skipped", "completed"}
+    assert results_payload["summary"]["rows"] == len(SAMPLE_ROWS)
+    assert results_payload["summary"]["columns"] == len(SAMPLE_ROWS[0])
+    assert "generatedAt" in results_payload
+    schema_names = {entry["name"] for entry in results_payload.get("schema", [])}
+    assert {"id", "value"}.issubset(schema_names)
+    assert results_payload["links"]["input"] == f"s3://{staged_bucket}/{staged_key}"
+    assert results_payload["links"]["resultsManifest"].endswith("results/manifest.json")
+    assert results_payload["links"]["resultsJson"].endswith("results/results.json")
 
     manifest_obj = fake_s3.get_object(Bucket=processor_module.ARTIFACTS_BUCKET, Key=response["manifestKey"])
     manifest = json.loads(manifest_obj["Body"].read().decode("utf-8"))

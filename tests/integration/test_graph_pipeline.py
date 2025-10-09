@@ -179,3 +179,26 @@ def test_pipeline_streams_delimited_input_without_full_decode():
     assert ingest["sourceFormat"] == "csv"
     assert ingest["bytesRead"] == len(payload)
     assert stream.closed is True
+
+
+def test_pipeline_handles_duplicate_column_headers():
+    csv_payload = (
+        "PassengerId,Age,Age,Sex,Sex\n"
+        "1,22,23,0,1\n"
+        "2,38,39,1,0\n"
+    ).encode("utf-8")
+
+    job_id = "job-duplicate-headers"
+    result = run_pipeline(job_id, {"key": "duplicate.csv"}, csv_payload, artifact_prefix=f"artifacts/{job_id}")
+
+    ingest = result.phases["ingest"]
+    assert ingest["rows"] == 2
+    assert set(ingest["columns"]) == {"PassengerId", "Age", "Age_2", "Sex", "Sex_2"}
+
+    stats_phase = result.phases["descriptive_stats"]
+    table = stats_phase.get("descriptiveTable", [])
+    # Expect statistics for both Age columns and PassengerId
+    columns_in_stats = {row["column"] for row in table}
+    assert {"Age", "Age_2", "PassengerId"}.issubset(columns_in_stats)
+
+    assert any(key.startswith("results/graphs/") for key in result.artifact_contents.keys())
