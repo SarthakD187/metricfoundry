@@ -1,13 +1,12 @@
+# lambdas/processor/Dockerfile
 FROM public.ecr.aws/lambda/python:3.12
 
-# Install heavyweight analytics dependencies required by the processor.
-COPY lambdas/processor/requirements.txt ${LAMBDA_TASK_ROOT}/requirements.txt
-RUN pip install --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt \
-    && rm -rf ~/.cache/pip
+# Install deps first to leverage Docker layer caching
+COPY requirements.txt .
+RUN pip install -r requirements.txt --target "${LAMBDA_TASK_ROOT}"
 
-# Copy the shared services code and the processor handler into the image.
-COPY services ${LAMBDA_TASK_ROOT}/services
-COPY lambdas/processor ${LAMBDA_TASK_ROOT}/
+# Copy function code
+COPY handler.py ${LAMBDA_TASK_ROOT}
 
-CMD ["handler.main"]
+# Command is handler.handler (the Python function)
+CMD ["handler.handler"]

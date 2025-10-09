@@ -11,3 +11,8 @@ dist/
 dashboard/node_modules
 dashboard/.next
 dashboard/out
+.DS_Store
+.next/
+dashboard/.env.local
+bucket-cors.json
+dashboard/bucket-cors.json

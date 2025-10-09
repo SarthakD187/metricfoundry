@@ -37,6 +37,23 @@ cloudwatch = boto3.client("cloudwatch")
 
 app = FastAPI(title="MetricFoundry API")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="MetricFoundry API")
+
+# --- CORS for local dashboard ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],      # allow Content-Type, etc.
+    expose_headers=["*"],     # surface x-request-id, ETag, etc.
+    allow_credentials=False,  # set True only if you actually use cookies/auth headers
+)
+
 # ---- Models ----
 class CreateJob(BaseModel):
     """Request payload for job creation.

@@ -11,6 +11,10 @@ export default function DashboardHome() {
   const { jobs, addJob, updateJob, removeJob } = usePersistentJobs([]);
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [existingJobId, setExistingJobId] = useState('');
+  const [mounted, setMounted] = useState(false);
+
+  // Ensure client and server render the SAME markup initially.
+  useEffect(() => setMounted(true), []);
 
   const refreshJob = useCallback(
     async (jobId: string) => {
@@ -22,7 +26,10 @@ export default function DashboardHome() {
           createdAt: response.createdAt,
           updatedAt: response.updatedAt,
           resultKey: response.resultKey ?? null,
-          sourceType: typeof response.source === 'object' && response.source?.type ? String(response.source.type) : undefined,
+          sourceType:
+            typeof response.source === 'object' && (response as any).source?.type
+              ? String((response as any).source.type)
+              : undefined,
           error: (response as any).error ?? null,
         });
       } catch (error) {
@@ -62,7 +69,10 @@ export default function DashboardHome() {
         createdAt: response.createdAt,
         updatedAt: response.updatedAt,
         resultKey: response.resultKey ?? null,
-        sourceType: typeof response.source === 'object' && response.source?.type ? String(response.source.type) : undefined,
+        sourceType:
+          typeof response.source === 'object' && (response as any).source?.type
+            ? String((response as any).source.type)
+            : undefined,
       });
       setExistingJobId('');
     } catch (error) {
@@ -71,24 +81,26 @@ export default function DashboardHome() {
     }
   };
 
-  const activeJobIds = useMemo(() =>
-    jobs
-      .filter((job) => {
-        const status = job.status?.toUpperCase?.() ?? 'UNKNOWN';
-        return !['SUCCEEDED', 'FAILED'].includes(status);
-      })
-      .map((job) => job.jobId),
-  [jobs]);
+  const activeJobIds = useMemo(
+    () =>
+      jobs
+        .filter((job) => {
+          const status = job.status?.toUpperCase?.() ?? 'UNKNOWN';
+          return !['SUCCEEDED', 'FAILED'].includes(status);
+        })
+        .map((job) => job.jobId),
+    [jobs],
+  );
 
   useEffect(() => {
-    if (activeJobIds.length === 0) return undefined;
+    if (!mounted || activeJobIds.length === 0) return;
     const interval = setInterval(() => {
       activeJobIds.forEach((jobId) => {
         refreshJob(jobId);
       });
     }, POLL_INTERVAL);
     return () => clearInterval(interval);
-  }, [activeJobIds.join(','), refreshJob]);
+  }, [mounted, activeJobIds.join(','), refreshJob]);
 
   return (
     <>
@@ -101,8 +113,7 @@ export default function DashboardHome() {
             <span className="hero-badge">MetricFoundry</span>
             <h1>Operational console for your data workflows</h1>
             <p>
-              Upload datasets, orchestrate ingestion jobs, and explore artifacts with a modern, responsive interface
-              backed by the MetricFoundry API.
+              Upload datasets, orchestrate ingestion jobs, and explore artifacts with a modern, responsive interface backed by the MetricFoundry API.
             </p>
           </div>
           <div className="hero-panels">
@@ -142,12 +153,17 @@ export default function DashboardHome() {
               <h2>Recent activity</h2>
             </div>
             <p className="subtitle">
-              Jobs are stored locally in your browser for convenience. Finalised jobs can be removed from the list without
-              affecting the underlying data.
+              Jobs are stored locally in your browser for convenience. Finalised jobs can be removed from the list without affecting the underlying data.
             </p>
           </div>
 
-          {jobs.length === 0 ? (
+          {/* Ensure SSR and first client render match */}
+          {!mounted ? (
+            <div className="empty-state">
+              <h3>Loading…</h3>
+              <p>Preparing your recent jobs.</p>
+            </div>
+          ) : jobs.length === 0 ? (
             <div className="empty-state">
               <h3>No jobs yet</h3>
               <p>Create a job above to see it appear here.</p>
