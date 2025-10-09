@@ -3,7 +3,8 @@ import io
 import json
 import os
 import time
-from typing import Any, Dict, Mapping
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Mapping, Optional
 
 import boto3
 from botocore.exceptions import ClientError
@@ -180,18 +181,74 @@ def _persist_pipeline_outputs(job_id: str, bucket: str, result: PipelineResult) 
     return {"manifest": manifest_key, **{f"phase:{k}": v for k, v in phase_keys.items()}}
 
 
-def build_results_payload(job_id: str, result: PipelineResult) -> Dict[str, Any]:
-    return {
+def _build_schema_from_profile(profile_phase: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    schema: List[Dict[str, Any]] = []
+    columns = profile_phase.get("columnProfiles")
+    if not isinstance(columns, list):
+        return schema
+    for item in columns:
+        if not isinstance(item, Mapping):
+            continue
+        name = item.get("name")
+        if name is None:
+            continue
+        entry: Dict[str, Any] = {"name": str(name)}
+        inferred = item.get("inferredType")
+        if inferred is not None:
+            entry["type"] = inferred
+        schema.append(entry)
+    return schema
+
+
+def build_results_payload(
+    job_id: str,
+    result: PipelineResult,
+    *,
+    source_input: Optional[Mapping[str, Any]] = None,
+    artifact_bucket: Optional[str] = None,
+) -> Dict[str, Any]:
+    metrics = dict(result.metrics)
+    summary = {
+        "rows": metrics.get("rows"),
+        "columns": metrics.get("columns"),
+        "bytesRead": metrics.get("bytesRead"),
+        "datasetCompleteness": metrics.get("datasetCompleteness"),
+        "dqScore": metrics.get("dqScore"),
+    }
+    summary = {key: value for key, value in summary.items() if value is not None}
+
+    links: Dict[str, str] = {}
+    if source_input:
+        src_bucket = source_input.get("bucket")
+        src_key = source_input.get("key")
+        if src_bucket and src_key:
+            links["input"] = f"s3://{src_bucket}/{src_key}"
+
+    if artifact_bucket:
+        manifest_uri = f"s3://{artifact_bucket}/{manifest_key_for(job_id)}"
+        results_uri = f"s3://{artifact_bucket}/{result_key_for(job_id)}"
+        links["resultsManifest"] = manifest_uri
+        links["resultsJson"] = results_uri
+
+    profile_phase = result.phases.get("profile", {})
+
+    payload = {
         "jobId": job_id,
         "analysisVersion": ANALYSIS_VERSION,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "summary": summary,
+        "schema": _build_schema_from_profile(profile_phase),
+        "links": links,
         "phases": result.phases,
-        "metrics": result.metrics,
+        "metrics": metrics,
         "correlations": result.correlations,
         "outliers": result.outliers,
         "mlInference": result.ml_inference,
         "artifactManifest": result.manifest,
         "phaseArtifactKeys": {phase: phase_key_for(job_id, phase) for phase in result.phases},
     }
+
+    return payload
 
 
 def main(event, _ctx):
@@ -244,7 +301,12 @@ def main(event, _ctx):
         target_bucket = ARTIFACTS_BUCKET or bucket
         artifact_keys = _persist_pipeline_outputs(job_id, target_bucket, result)
 
-        results_payload = build_results_payload(job_id, result)
+        results_payload = build_results_payload(
+            job_id,
+            result,
+            source_input=payload_input,
+            artifact_bucket=target_bucket,
+        )
         _put_object(target_bucket, results_key, _json_bytes(results_payload), "application/json")
 
         try:

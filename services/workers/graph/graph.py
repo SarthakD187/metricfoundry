@@ -31,6 +31,7 @@ from typing import (
     MutableMapping,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Union,
     cast,
@@ -437,11 +438,44 @@ def _format_preview(value: Any) -> Any:
     return text
 
 
+class _HeaderNormalizer:
+    """Normalizes and deduplicates column headers for delimited inputs."""
+
+    def __init__(self) -> None:
+        self._base_counts: Dict[str, int] = {}
+        self._used: Set[str] = set()
+
+    def _clean(self, raw: Any, index: int) -> str:
+        text = "" if raw is None else str(raw)
+        text = text.lstrip("\ufeff").strip()
+        if not text:
+            return f"column_{index + 1}"
+        return text
+
+    def _allocate(self, base: str) -> str:
+        count = self._base_counts.get(base, 0)
+        candidate = base if count == 0 else f"{base}_{count + 1}"
+        while candidate in self._used:
+            count += 1
+            candidate = f"{base}_{count + 1}"
+        self._base_counts[base] = count + 1
+        self._used.add(candidate)
+        return candidate
+
+    def normalize(self, fieldnames: Sequence[Any]) -> List[str]:
+        return [self._allocate(self._clean(name, index)) for index, name in enumerate(fieldnames)]
+
+    def generate_default(self, index: int) -> str:
+        return self._allocate(f"column_{index + 1}")
+
+
 def _ingest_delimited(key: str, body: BinaryInput, delimiter: str, source_format: str) -> DatasetSummary:
     stream, should_close = _open_binary_stream(body)
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     builder = _DatasetBuilder(bytes_read=0, source_format=source_format)
     buffer = ""
+    normalizer = _HeaderNormalizer()
+    headers: List[str] = []
 
     def _iter_lines() -> Iterable[str]:
         nonlocal buffer
@@ -473,9 +507,27 @@ def _ingest_delimited(key: str, body: BinaryInput, delimiter: str, source_format
             yield buffer
 
     try:
-        reader = csv.DictReader(_iter_lines(), delimiter=delimiter)
-        for row in reader:
-            builder.process_row(row)
+        raw_reader = csv.reader(_iter_lines(), delimiter=delimiter)
+        try:
+            first_row = next(raw_reader)
+        except StopIteration:
+            return builder.build()
+
+        headers = normalizer.normalize(first_row)
+
+        for raw_row in raw_reader:
+            if not raw_row or all((cell.strip() == "" for cell in raw_row)):
+                continue
+
+            row = list(raw_row)
+            if len(row) < len(headers):
+                row.extend([""] * (len(headers) - len(row)))
+            elif len(row) > len(headers):
+                while len(headers) < len(row):
+                    headers.append(normalizer.generate_default(len(headers)))
+
+            record = {headers[index]: row[index] if index < len(row) else "" for index in range(len(headers))}
+            builder.process_row(record)
         return builder.build()
     finally:
         if should_close:
