@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 export type JobLifecycleState =
   | 'CREATED'
@@ -47,15 +47,21 @@ function reviveJobs(value: string | null, fallback: TrackedJob[]): TrackedJob[] 
 }
 
 export function usePersistentJobs(initial: TrackedJob[] = []) {
-  const [jobs, setJobs] = useState<TrackedJob[]>(() => {
-    if (typeof window === 'undefined') return initial;
-    return reviveJobs(window.localStorage.getItem(STORAGE_KEY), initial);
-  });
+  const initialRef = useRef(initial);
+  const [jobs, setJobs] = useState<TrackedJob[]>(initialRef.current);
+  const [hasLoaded, setHasLoaded] = useState(false);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
+    const revived = reviveJobs(window.localStorage.getItem(STORAGE_KEY), initialRef.current);
+    setJobs(revived);
+    setHasLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !hasLoaded) return;
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(jobs));
-  }, [jobs]);
+  }, [jobs, hasLoaded]);
 
   const addJob = useCallback((job: TrackedJob) => {
     setJobs((prev: TrackedJob[]) => {
