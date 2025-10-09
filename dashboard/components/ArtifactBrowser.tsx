@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ArtifactListResponse, ArtifactObjectSummary, fetchArtifacts } from '../lib/api';
+import { ArtifactListResponse, ArtifactObjectSummary, listArtifacts } from '../lib/api';
 
 interface ArtifactBrowserProps {
   jobId: string;
@@ -50,7 +50,7 @@ export function ArtifactBrowser({ jobId }: ArtifactBrowserProps) {
       try {
         setLoading(true);
         setError(null);
-        const response: ArtifactListResponse = await fetchArtifacts(jobId, {
+        const response: ArtifactListResponse = await listArtifacts(jobId, {
           prefix: target,
           continuationToken: token ?? undefined,
           pageSize: PAGE_SIZE,
@@ -94,9 +94,30 @@ export function ArtifactBrowser({ jobId }: ArtifactBrowserProps) {
   const relativePrefix = prefix.replace(basePrefix, '') || '/';
   const parent = parentPrefix(prefix, basePrefix);
 
+  const breadcrumbs = useMemo(() => {
+    const parts = prefix
+      .replace(basePrefix, '')
+      .split('/')
+      .filter(Boolean);
+
+    const crumbs = parts.map((segment, index) => {
+      const target = `${basePrefix}${parts.slice(0, index + 1).join('/')}/`;
+      return { label: segment, target };
+    });
+
+    return [
+      { label: 'Job root', target: basePrefix, isActive: crumbs.length === 0 },
+      ...crumbs.map((crumb, index) => ({
+        ...crumb,
+        isActive: index === crumbs.length - 1,
+      })),
+    ];
+  }, [basePrefix, prefix]);
+
   const handleLoadMore = () => {
-    if (!nextToken) return;
-    fetchArtifacts(jobId, { prefix, continuationToken: nextToken, pageSize: PAGE_SIZE })
+    if (!nextToken || loading) return;
+    setLoading(true);
+    listArtifacts(jobId, { prefix, continuationToken: nextToken, pageSize: PAGE_SIZE })
       .then((response) => {
         const directories = (response.commonPrefixes ?? [])
           .filter((item): item is string => Boolean(item))
@@ -116,70 +137,109 @@ export function ArtifactBrowser({ jobId }: ArtifactBrowserProps) {
       .catch((err) => {
         console.error('Failed to load more artifacts', err);
         setError(err instanceof Error ? err.message : 'Unable to load more artifacts');
+      })
+      .finally(() => {
+        setLoading(false);
       });
   };
 
   return (
     <div className="artifact-browser">
-      <div className="artifact-header">
-        <div>
-          <p className="eyebrow">Artifacts</p>
-          <h3>{relativePrefix}</h3>
-        </div>
-        <div className="artifact-actions">
-          {parent && (
-            <button type="button" onClick={() => setPrefix(parent)}>
-              ← Up a level
-            </button>
-          )}
-        </div>
-      </div>
-
-      {error && <div className="error-banner">{error}</div>}
-
-      <div className="artifact-table" role="list">
-        {objects.length === 0 && !loading && <p className="empty-state">No artifacts yet.</p>}
-
-        {objects.map((entry) => (
-          <div
-            key={`${entry.type}-${entry.type === 'folder' ? entry.prefix : entry.key}`}
-            className={`artifact-row ${entry.type}`}
-            role="listitem"
-          >
-            <div className="artifact-meta">
-              <span className="artifact-name">{entry.name || (entry.type === 'folder' ? '(folder)' : '(file)')}</span>
-              <span className="artifact-subtle">
-                {entry.type === 'folder'
-                  ? 'Folder'
-                  : `${entry.lastModified ? new Date(entry.lastModified).toLocaleString() : 'Unknown date'} · ${formatBytes(entry.size)}`}
-              </span>
-            </div>
-            <div className="artifact-actions">
-              {entry.type === 'folder' ? (
-                <button type="button" onClick={() => setPrefix(entry.prefix!)}>
-                  Open
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => navigator.clipboard?.writeText(entry.key ?? '')}
-                  title="Copy object key"
-                >
-                  Copy key
-                </button>
-              )}
-            </div>
+      <section className="artifact-shell">
+        <header className="artifact-shell__header">
+          <div>
+            <span className="artifact-chip">Artifacts</span>
+            <h3>{relativePrefix === '/' ? 'All outputs' : relativePrefix}</h3>
           </div>
-        ))}
-      </div>
+          <div className="artifact-shell__controls">
+            {parent && (
+              <button type="button" className="artifact-button ghost" onClick={() => setPrefix(parent)}>
+                ← Parent folder
+              </button>
+            )}
+          </div>
+        </header>
 
-      {nextToken && (
-        <div className="load-more">
-          <button type="button" onClick={handleLoadMore} disabled={loading}>
-            {loading ? 'Loading…' : 'Load more'}
-          </button>
+        <nav className="artifact-breadcrumbs" aria-label="Artifact breadcrumbs">
+          {breadcrumbs.map((crumb, index) => (
+            <button
+              key={`${crumb.label}-${index}`}
+              type="button"
+              className={`artifact-breadcrumb ${crumb.isActive ? 'active' : ''}`}
+              onClick={() => !crumb.isActive && setPrefix(crumb.target)}
+              disabled={crumb.isActive}
+            >
+              {crumb.label}
+            </button>
+          ))}
+        </nav>
+
+        {error && <div className="artifact-banner error">{error}</div>}
+
+        <div className="artifact-tiles" role="list">
+          {objects.length === 0 && !loading && (
+            <div className="artifact-empty" role="note">
+              <h4>No artifacts yet</h4>
+              <p>Generated files for this job will appear here once the run completes.</p>
+            </div>
+          )}
+
+          {objects.map((entry) => {
+            const key = `${entry.type}-${entry.type === 'folder' ? entry.prefix : entry.key}`;
+            const metaText =
+              entry.type === 'folder'
+                ? 'Folder'
+                : `${entry.lastModified ? new Date(entry.lastModified).toLocaleString() : 'Unknown date'} · ${formatBytes(entry.size)}`;
+
+            return (
+              <div key={key} className={`artifact-tile ${entry.type}`} role="listitem">
+                <div className="artifact-tile__body">
+                  <div className="artifact-icon" aria-hidden>
+                    {entry.type === 'folder' ? '📁' : '📄'}
+                  </div>
+                  <div className="artifact-tile__text">
+                    <span className="artifact-tile__name">
+                      {entry.name || (entry.type === 'folder' ? '(folder)' : '(file)')}
+                    </span>
+                    <span className="artifact-tile__meta">{metaText}</span>
+                  </div>
+                </div>
+                <div className="artifact-tile__actions">
+                  {entry.type === 'folder' ? (
+                    <button type="button" className="artifact-button" onClick={() => setPrefix(entry.prefix!)}>
+                      Open folder
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="artifact-button ghost"
+                      onClick={() => navigator.clipboard?.writeText(entry.key ?? '')}
+                      title="Copy object key"
+                    >
+                      Copy key
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
-      )}
+
+        {loading && (
+          <div className="artifact-loader" role="status" aria-live="polite">
+            <span className="artifact-loader__dot" aria-hidden />
+            <span>{objects.length ? 'Loading more items…' : 'Loading artifacts…'}</span>
+          </div>
+        )}
+
+        {nextToken && (
+          <div className="artifact-shell__footer">
+            <button type="button" className="artifact-button" onClick={handleLoadMore} disabled={loading}>
+              {loading ? 'Loading…' : 'Load more'}
+            </button>
+          </div>
+        )}
+      </section>
     </div>
   );
 }

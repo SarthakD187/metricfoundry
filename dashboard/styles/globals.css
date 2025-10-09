@@ -5,9 +5,14 @@
     radial-gradient(circle at 50% 100%, rgba(45, 212, 191, 0.2), transparent 50%);
   --panel-bg: rgba(255, 255, 255, 0.78);
   --panel-border: rgba(255, 255, 255, 0.4);
+  --mf-plum: #88498f;
+  --mf-teal: #779fa1;
+  --mf-sand: #e0cba8;
+  --mf-coral: #ff6542;
+  --mf-ink: #564154;
   --text-primary: #0f172a;
   --text-secondary: #334155;
-  --accent: #2563eb;
+  --accent: var(--mf-plum);
   --accent-soft: rgba(37, 99, 235, 0.12);
   --success: #059669;
   --danger: #dc2626;
@@ -516,77 +521,272 @@ button.secondary {
 
 .artifact-browser {
   display: flex;
-  flex-direction: column;
-  gap: 1rem;
-}
-
-.artifact-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.artifact-table {
-  border-radius: 16px;
-  border: 1px solid rgba(15, 23, 42, 0.1);
-  background: rgba(255, 255, 255, 0.8);
-  overflow: hidden;
-}
-
-.artifact-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 0.85rem 1rem;
-  border-bottom: 1px solid rgba(15, 23, 42, 0.06);
-  gap: 1rem;
-}
-
-.artifact-row:last-child {
-  border-bottom: none;
-}
-
-.artifact-meta {
-  display: flex;
-  flex-direction: column;
-}
-
-.artifact-name {
-  font-weight: 600;
-}
-
-.artifact-subtle {
-  font-size: 0.8rem;
-  color: var(--text-secondary);
-}
-
-.artifact-actions button {
-  background: rgba(15, 23, 42, 0.08);
-  color: var(--text-primary);
-  box-shadow: none;
-}
-
-.artifact-actions button:hover {
-  background: rgba(15, 23, 42, 0.15);
-}
-
-.load-more {
-  display: flex;
   justify-content: center;
 }
 
-.empty-state {
+.artifact-shell {
+  width: 100%;
+  max-width: 1100px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1.75rem;
+  padding: 2.25rem;
+  border-radius: 28px;
+  border: 1px solid rgba(86, 65, 84, 0.18);
+  background: linear-gradient(135deg, rgba(136, 73, 143, 0.08), rgba(224, 203, 168, 0.16)),
+    rgba(255, 255, 255, 0.85);
+  box-shadow: 0 40px 80px -60px rgba(86, 65, 84, 0.45);
+}
+
+.artifact-shell__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1.5rem;
+}
+
+.artifact-shell__header h3 {
+  margin: 0.35rem 0 0;
+  font-size: clamp(1.5rem, 3vw, 2rem);
+  color: var(--mf-ink);
+}
+
+.artifact-shell__controls {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.artifact-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.85rem;
+  border-radius: 999px;
+  background: rgba(119, 159, 161, 0.15);
+  color: var(--mf-teal);
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.artifact-button {
+  border: none;
+  border-radius: 14px;
+  background: linear-gradient(135deg, var(--mf-plum), var(--mf-coral));
+  color: #fff;
+  padding: 0.6rem 1.25rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, filter 0.18s ease;
+  box-shadow: 0 12px 25px -15px rgba(136, 73, 143, 0.6);
+}
+
+.artifact-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  filter: brightness(1.03);
+}
+
+.artifact-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.artifact-button.ghost {
+  background: rgba(119, 159, 161, 0.2);
+  color: var(--mf-ink);
+  box-shadow: none;
+}
+
+.artifact-button.ghost:hover:not(:disabled) {
+  background: rgba(119, 159, 161, 0.3);
+}
+
+.artifact-breadcrumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.artifact-breadcrumb {
+  border: none;
+  border-radius: 999px;
+  padding: 0.35rem 0.9rem;
+  background: rgba(224, 203, 168, 0.4);
+  color: var(--mf-ink);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+.artifact-breadcrumb:hover:not(:disabled) {
+  background: rgba(255, 101, 66, 0.2);
+  color: var(--mf-coral);
+}
+
+.artifact-breadcrumb.active {
+  background: rgba(136, 73, 143, 0.25);
+  color: var(--mf-plum);
+  cursor: default;
+}
+
+.artifact-banner {
+  padding: 0.85rem 1.1rem;
+  border-radius: 16px;
+  font-weight: 600;
+  background: rgba(224, 203, 168, 0.35);
+  color: var(--mf-ink);
+}
+
+.artifact-banner.error {
+  background: rgba(255, 101, 66, 0.12);
+  color: var(--mf-coral);
+  border: 1px solid rgba(255, 101, 66, 0.25);
+}
+
+.artifact-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1.5rem;
+}
+
+.artifact-tile {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem;
+  border-radius: 22px;
+  border: 1px solid rgba(119, 159, 161, 0.25);
+  background: rgba(255, 255, 255, 0.85);
+  box-shadow: 0 25px 50px -40px rgba(86, 65, 84, 0.35);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.artifact-tile:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 30px 60px -45px rgba(86, 65, 84, 0.45);
+}
+
+.artifact-tile.folder {
+  background: linear-gradient(145deg, rgba(119, 159, 161, 0.16), rgba(255, 255, 255, 0.9));
+}
+
+.artifact-tile.file {
+  background: linear-gradient(145deg, rgba(136, 73, 143, 0.16), rgba(255, 255, 255, 0.9));
+}
+
+.artifact-tile__body {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.artifact-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 16px;
+  display: grid;
+  place-items: center;
+  font-size: 1.5rem;
+  background: rgba(86, 65, 84, 0.08);
+}
+
+.artifact-tile__text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.artifact-tile__name {
+  font-weight: 700;
+  color: var(--mf-ink);
+  word-break: break-word;
+}
+
+.artifact-tile__meta {
+  font-size: 0.85rem;
+  color: rgba(86, 65, 84, 0.75);
+}
+
+.artifact-tile__actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.artifact-empty {
+  grid-column: 1 / -1;
   text-align: center;
   padding: 3rem 2rem;
-  background: rgba(255, 255, 255, 0.6);
   border-radius: 24px;
-  border: 1px dashed rgba(37, 99, 235, 0.3);
-  color: var(--text-secondary);
+  border: 1px dashed rgba(119, 159, 161, 0.45);
+  background: rgba(224, 203, 168, 0.2);
+  color: var(--mf-ink);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.artifact-empty h4 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.artifact-empty p {
+  margin: 0;
+  max-width: 420px;
+  color: rgba(86, 65, 84, 0.75);
+}
+
+.artifact-loader {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-weight: 600;
+  color: var(--mf-plum);
+  align-self: center;
+}
+
+.artifact-loader__dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: var(--mf-plum);
+  animation: artifact-pulse 0.9s infinite ease-in-out;
+}
+
+@keyframes artifact-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.4;
+  }
+  50% {
+    transform: scale(1.35);
+    opacity: 1;
+  }
+}
+
+.artifact-shell__footer {
+  display: flex;
+  justify-content: center;
 }
 
 @media (max-width: 768px) {
   .page {
     padding: 2rem 1.25rem 4rem;
+  }
+
+  .artifact-shell {
+    padding: 1.5rem;
+    gap: 1.5rem;
+  }
+
+  .artifact-tiles {
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   }
 
   .job-card__header {

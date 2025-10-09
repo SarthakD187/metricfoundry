@@ -36,6 +36,30 @@ export interface ArtifactListResponse {
   nextToken?: string | null;
 }
 
+export interface ManifestArtifactEntry {
+  key?: string;
+  name?: string;
+  description?: string;
+  contentType?: string;
+  size?: number;
+  checksum?: string;
+  [key: string]: unknown;
+}
+
+export interface ManifestPayload {
+  basePath?: string;
+  artifacts?: ManifestArtifactEntry[];
+  dataQuality?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface ManifestResponse {
+  jobId: string;
+  manifest: ManifestPayload | null;
+  etag?: string | null;
+  contentLength?: number | null;
+}
+
 export interface ResultLinkResponse {
   jobId: string;
   downloadUrl: string;
@@ -112,9 +136,33 @@ export async function fetchResultLink(jobId: string, path?: string): Promise<Res
   return apiFetch<ResultLinkResponse>(`jobs/${encodeURIComponent(jobId)}/results${query}`);
 }
 
-export async function listArtifacts(jobId: string, prefix: string) {
-  const q = new URLSearchParams({ prefix });
-  return apiFetch<ArtifactListResponse>(`jobs/${encodeURIComponent(jobId)}/artifacts?${q}`);
+export interface ListArtifactsOptions {
+  prefix?: string;
+  continuationToken?: string | null;
+  pageSize?: number;
+  delimiter?: string | null;
+}
+
+export async function listArtifacts(
+  jobId: string,
+  options?: string | ListArtifactsOptions,
+): Promise<ArtifactListResponse> {
+  const opts: ListArtifactsOptions =
+    typeof options === "string" ? { prefix: options } : options ?? {};
+
+  const q = new URLSearchParams();
+  if (opts.prefix) q.set("prefix", opts.prefix);
+  if (opts.continuationToken) q.set("continuationToken", opts.continuationToken);
+  if (typeof opts.pageSize === "number") q.set("pageSize", String(opts.pageSize));
+  if (opts.delimiter !== undefined) q.set("delimiter", opts.delimiter ?? "");
+
+  const query = q.toString();
+  const suffix = query ? `?${query}` : "";
+  return apiFetch<ArtifactListResponse>(`jobs/${encodeURIComponent(jobId)}/artifacts${suffix}`);
+}
+
+export async function fetchManifest(jobId: string): Promise<ManifestResponse> {
+  return apiFetch<ManifestResponse>(`jobs/${encodeURIComponent(jobId)}/manifest`);
 }
 
 export async function presign(jobId: string, key: string) {
