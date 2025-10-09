@@ -1,15 +1,22 @@
-import csv
-import io
+"""Analytics processor Lambda entrypoint."""
+from __future__ import annotations
+
 import json
 import os
 import time
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import boto3
 from botocore.exceptions import ClientError
 
-from services.workers.graph.graph import PHASE_ORDER, PipelineResult, run_pipeline
+from services.common.pipeline import (
+    ANALYSIS_VERSION,
+    build_results_payload,
+    persist_pipeline_outputs,
+    result_key_for,
+    summarize_phase_payload,
+)
+from services.workers.graph.graph import PHASE_ORDER, run_pipeline
 
 s3 = boto3.client("s3")
 ddb = boto3.resource("dynamodb")
@@ -21,8 +28,6 @@ STATUS_RUNNING = "RUNNING"
 STATUS_SUCCEEDED = "SUCCEEDED"
 STATUS_FAILED = "FAILED"
 
-ANALYSIS_VERSION = "2024.05"
-
 
 def ddb_table():
     return ddb.Table(TABLE_NAME)
@@ -33,14 +38,16 @@ def now_epoch() -> int:
 
 
 def ddb_upsert_status(job_id: str, status: str, **attrs) -> None:
-    expr_names = {"#s": "status"}
-    expr_vals = {":s": status, ":u": now_epoch()}
-    set_clauses = ["#s = :s", "updatedAt = :u"]
+    expr_names = {"#s": "status", "#u": "updatedAt"}
+    expr_vals: Dict[str, Any] = {":s": status, ":u": now_epoch()}
+    set_clauses = ["#s = :s", "#u = :u"]
 
-    for k, v in attrs.items():
-        placeholder = f":{k}"
-        expr_vals[placeholder] = v
-        set_clauses.append(f"{k} = {placeholder}")
+    for key, value in attrs.items():
+        placeholder = f":{key}"
+        expr_vals[placeholder] = value
+        name_alias = f"#{key}"
+        expr_names[name_alias] = key
+        set_clauses.append(f"{name_alias} = {placeholder}")
 
     ddb_table().update_item(
         Key={"pk": f"job#{job_id}", "sk": "meta"},
@@ -50,104 +57,25 @@ def ddb_upsert_status(job_id: str, status: str, **attrs) -> None:
     )
 
 
-def result_key_for(job_id: str) -> str:
-    return f"artifacts/{job_id}/results/results.json"
-
-
-def manifest_key_for(job_id: str) -> str:
-    return f"artifacts/{job_id}/results/manifest.json"
-
-
-def phase_key_for(job_id: str, phase: str) -> str:
-    return f"artifacts/{job_id}/phases/{phase}.json"
-
-
-def artifact_key_for(job_id: str, relative: str) -> str:
-    return f"artifacts/{job_id}/{relative}"
-
-
 def object_exists(bucket: str, key: str) -> bool:
     try:
         s3.head_object(Bucket=bucket, Key=key)
         return True
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code")
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
         if code in ("404", "NotFound", "NoSuchKey"):
             return False
         raise
-
-
-def _json_bytes(data: Any) -> bytes:
-    return json.dumps(data, indent=2, default=str).encode("utf-8")
-
-
-def _csv_bytes(headers: list[str], rows: list[Mapping[str, Any]]) -> bytes:
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=headers)
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({h: row.get(h, "") for h in headers})
-    return output.getvalue().encode("utf-8")
 
 
 def _put_object(bucket: str, key: str, body: bytes, content_type: str) -> None:
     s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType=content_type)
 
 
-def _persist_artifact(bucket: str, key: str, spec: Mapping[str, Any]) -> None:
-    kind = spec.get("kind")
-    content_type = spec.get("contentType", "application/octet-stream")
-    if kind == "json":
-        body = _json_bytes(spec.get("data"))
-    elif kind == "text":
-        text = spec.get("text", "")
-        body = text.encode("utf-8")
-    elif kind == "csv":
-        headers = spec.get("headers", [])
-        rows = spec.get("rows", [])
-        body = _csv_bytes(list(headers), list(rows))
-    elif kind == "html":
-        html = spec.get("html", "")
-        if isinstance(html, bytes):
-            body = html
-        else:
-            body = str(html).encode("utf-8")
-    elif kind == "image":
-        data = spec.get("data", b"")
-        if isinstance(data, memoryview):  # pragma: no cover - defensive conversion
-            data = data.tobytes()
-        if not isinstance(data, (bytes, bytearray)):
-            raise ValueError("Image artifact data must be bytes-like")
-        body = bytes(data)
-    elif kind == "binary":
-        data = spec.get("data", b"")
-        if isinstance(data, memoryview):
-            data = data.tobytes()
-        if not isinstance(data, (bytes, bytearray)):
-            raise ValueError("Binary artifact data must be bytes-like")
-        body = bytes(data)
-    else:
-        raise ValueError(f"Unsupported artifact kind: {kind}")
-    _put_object(bucket, key, body, content_type)
-
-
-def _summarize_phase_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
-    summary: Dict[str, Any] = {}
-    if "summary" in payload and isinstance(payload["summary"], str):
-        summary["summary"] = payload["summary"]
-    if "metrics" in payload and isinstance(payload["metrics"], Mapping):
-        summary["metrics"] = payload["metrics"]
-    if "datasetCompleteness" in payload:
-        summary["datasetCompleteness"] = payload["datasetCompleteness"]
-    if not summary:
-        keys = list(payload.keys())[:5]
-        summary["fields"] = keys
-    return summary
-
-
 def _default_callback(job_id: str):
     def _callback(phase: str, payload: Mapping[str, Any], index: int, total: int) -> None:
         progress = int(((index + 1) / total) * 100)
+        summary = summarize_phase_payload(payload)
         try:
             ddb_upsert_status(
                 job_id,
@@ -156,99 +84,12 @@ def _default_callback(job_id: str):
                 phaseIndex=index,
                 phaseCount=total,
                 progress=progress,
-                phaseSummary=_summarize_phase_payload(payload),
+                phaseSummary=summary,
             )
         except Exception as exc:  # pragma: no cover - DynamoDB errors shouldn't halt job
             print(f"[ProcessorFn] Warning: failed to stream phase status for {phase}: {exc}")
 
     return _callback
-
-
-def _persist_pipeline_outputs(job_id: str, bucket: str, result: PipelineResult) -> Dict[str, str]:
-    phase_keys: Dict[str, str] = {}
-    for phase, payload in result.phases.items():
-        key = phase_key_for(job_id, phase)
-        _put_object(bucket, key, _json_bytes(payload), "application/json")
-        phase_keys[phase] = key
-
-    for relative, spec in result.artifact_contents.items():
-        key = artifact_key_for(job_id, relative)
-        _persist_artifact(bucket, key, spec)
-
-    manifest_key = manifest_key_for(job_id)
-    _put_object(bucket, manifest_key, _json_bytes(result.manifest), "application/json")
-
-    return {"manifest": manifest_key, **{f"phase:{k}": v for k, v in phase_keys.items()}}
-
-
-def _build_schema_from_profile(profile_phase: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    schema: List[Dict[str, Any]] = []
-    columns = profile_phase.get("columnProfiles")
-    if not isinstance(columns, list):
-        return schema
-    for item in columns:
-        if not isinstance(item, Mapping):
-            continue
-        name = item.get("name")
-        if name is None:
-            continue
-        entry: Dict[str, Any] = {"name": str(name)}
-        inferred = item.get("inferredType")
-        if inferred is not None:
-            entry["type"] = inferred
-        schema.append(entry)
-    return schema
-
-
-def build_results_payload(
-    job_id: str,
-    result: PipelineResult,
-    *,
-    source_input: Optional[Mapping[str, Any]] = None,
-    artifact_bucket: Optional[str] = None,
-) -> Dict[str, Any]:
-    metrics = dict(result.metrics)
-    summary = {
-        "rows": metrics.get("rows"),
-        "columns": metrics.get("columns"),
-        "bytesRead": metrics.get("bytesRead"),
-        "datasetCompleteness": metrics.get("datasetCompleteness"),
-        "dqScore": metrics.get("dqScore"),
-    }
-    summary = {key: value for key, value in summary.items() if value is not None}
-
-    links: Dict[str, str] = {}
-    if source_input:
-        src_bucket = source_input.get("bucket")
-        src_key = source_input.get("key")
-        if src_bucket and src_key:
-            links["input"] = f"s3://{src_bucket}/{src_key}"
-
-    if artifact_bucket:
-        manifest_uri = f"s3://{artifact_bucket}/{manifest_key_for(job_id)}"
-        results_uri = f"s3://{artifact_bucket}/{result_key_for(job_id)}"
-        links["resultsManifest"] = manifest_uri
-        links["resultsJson"] = results_uri
-
-    profile_phase = result.phases.get("profile", {})
-
-    payload = {
-        "jobId": job_id,
-        "analysisVersion": ANALYSIS_VERSION,
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "summary": summary,
-        "schema": _build_schema_from_profile(profile_phase),
-        "links": links,
-        "phases": result.phases,
-        "metrics": metrics,
-        "correlations": result.correlations,
-        "outliers": result.outliers,
-        "mlInference": result.ml_inference,
-        "artifactManifest": result.manifest,
-        "phaseArtifactKeys": {phase: phase_key_for(job_id, phase) for phase in result.phases},
-    }
-
-    return payload
 
 
 def main(event, _ctx):
@@ -264,8 +105,8 @@ def main(event, _ctx):
 
     try:
         ddb_upsert_status(job_id, STATUS_RUNNING, inputKey=key, currentPhase=PHASE_ORDER[0], progress=0)
-    except Exception as e:
-        print(f"[ProcessorFn] Warning: failed to upsert initial RUNNING status: {e}")
+    except Exception as exc:
+        print(f"[ProcessorFn] Warning: failed to upsert initial RUNNING status: {exc}")
 
     artifact_prefix = f"artifacts/{job_id}"
     results_key = result_key_for(job_id)
@@ -276,8 +117,8 @@ def main(event, _ctx):
                 f"[ProcessorFn] Results already exist at s3://{ARTIFACTS_BUCKET}/{results_key} (idempotent skip)."
             )
             return {"ok": True, "jobId": job_id, "resultKey": results_key, "idempotent": True}
-    except Exception as e:
-        print(f"[ProcessorFn] Warning: head_object failed for existing results check: {e}")
+    except Exception as exc:
+        print(f"[ProcessorFn] Warning: head_object failed for existing results check: {exc}")
 
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
@@ -299,15 +140,21 @@ def main(event, _ctx):
                     pass
 
         target_bucket = ARTIFACTS_BUCKET or bucket
-        artifact_keys = _persist_pipeline_outputs(job_id, target_bucket, result)
+        artifact_keys = persist_pipeline_outputs(job_id, target_bucket, result, s3_client=s3)
 
         results_payload = build_results_payload(
             job_id,
             result,
             source_input=payload_input,
             artifact_bucket=target_bucket,
+            analysis_version=ANALYSIS_VERSION,
         )
-        _put_object(target_bucket, results_key, _json_bytes(results_payload), "application/json")
+        _put_object(
+            target_bucket,
+            results_key,
+            json.dumps(results_payload, indent=2, default=str).encode("utf-8"),
+            "application/json",
+        )
 
         try:
             ddb_upsert_status(
@@ -317,20 +164,20 @@ def main(event, _ctx):
                 manifestKey=artifact_keys.get("manifest"),
                 completedAt=now_epoch(),
             )
-        except Exception as e:
-            print(f"[ProcessorFn] Warning: failed to upsert SUCCEEDED status: {e}")
+        except Exception as exc:
+            print(f"[ProcessorFn] Warning: failed to upsert SUCCEEDED status: {exc}")
 
         print(f"[ProcessorFn] Wrote results to s3://{target_bucket}/{results_key}")
         return {"ok": True, "jobId": job_id, "resultKey": results_key, "manifestKey": artifact_keys.get("manifest")}
 
-    except Exception as e:
-        err_txt = f"{type(e).__name__}: {e}"
+    except Exception as exc:
+        err_txt = f"{type(exc).__name__}: {exc}"
         print(f"[ProcessorFn] ERROR: {err_txt}")
 
         try:
             ddb_upsert_status(job_id, STATUS_FAILED, error=err_txt[:1000])
-        except Exception as e2:
-            print(f"[ProcessorFn] Warning: failed to upsert FAILED status: {e2}")
+        except Exception as update_exc:
+            print(f"[ProcessorFn] Warning: failed to upsert FAILED status: {update_exc}")
 
         try:
             target_bucket = ARTIFACTS_BUCKET or bucket
@@ -338,10 +185,10 @@ def main(event, _ctx):
             _put_object(
                 target_bucket,
                 error_key,
-                _json_bytes({"jobId": job_id, "error": err_txt}),
+                json.dumps({"jobId": job_id, "error": err_txt}, indent=2, default=str).encode("utf-8"),
                 "application/json",
             )
-        except Exception as e3:
-            print(f"[ProcessorFn] Warning: failed to write error artifact: {e3}")
+        except Exception as write_exc:
+            print(f"[ProcessorFn] Warning: failed to write error artifact: {write_exc}")
 
         raise

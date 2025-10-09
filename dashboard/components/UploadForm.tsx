@@ -4,7 +4,7 @@
 
 import React, { useCallback, useRef, useState } from "react";
 
-type OnJobCreated = () => Promise<{
+type OnJobCreated = (file: File | Blob) => Promise<{
   jobId: string;
   upload: (file: File | Blob) => Promise<void>;
 }>;
@@ -32,7 +32,7 @@ export default function UploadForm({
       try {
         setBusy("creating");
         setLocalMsg("Creating job…");
-        const { upload } = await onJobCreated();
+        const { upload } = await onJobCreated(file);
 
         setBusy("uploading");
         setLocalMsg("Uploading dataset…");

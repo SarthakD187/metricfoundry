@@ -97,10 +97,10 @@ export default function DashboardHome() {
     [],
   );
 
-  const handleJobCreated = useCallback(async () => {
+  const handleJobCreated = useCallback(async (file: File | Blob) => {
     setGlobalError(null);
     try {
-      const resp = await createUploadJob();
+      const resp = await createUploadJob(file);
       const jobId = resp.jobId;
       addJob({
         jobId,
@@ -283,8 +283,8 @@ export default function DashboardHome() {
 
           <div className="hero-actions">
             <UploadForm
-              onJobCreated={async () => {
-                const { jobId, uploadUrl } = await handleJobCreated();
+              onJobCreated={async (file) => {
+                const { jobId, uploadUrl } = await handleJobCreated(file);
                 return {
                   jobId,
                   upload: async (file: File | Blob) => {
