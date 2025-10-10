@@ -1,7 +1,16 @@
-import { useState } from 'react';
+// components/jobcard.tsx
+
+import React, { useEffect, useState } from 'react';
 import ArtifactBrowser from './ArtifactBrowser';
 import ManifestPreview from './ManifestPreview';
-import { fetchManifest, fetchResultLink, ManifestPayload } from '../lib/api';
+import ResultsViewer from './ResultsViewer';
+import {
+  fetchManifest,
+  fetchResultLink,
+  fetchResultsJson,
+  type ManifestPayload,
+  type ResultsJson,
+} from '../lib/api';
 import type { TrackedJob } from '../hooks/usePersistentJobs';
 
 interface JobCardProps {
@@ -13,12 +22,17 @@ interface JobCardProps {
 export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
   const [showArtifacts, setShowArtifacts] = useState(false);
   const [showManifest, setShowManifest] = useState(false);
+
   const [manifest, setManifest] = useState<ManifestPayload | null>(null);
   const [manifestError, setManifestError] = useState<string | null>(null);
   const [manifestLoading, setManifestLoading] = useState(false);
+
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [resultLoading, setResultLoading] = useState(false);
   const [resultError, setResultError] = useState<string | null>(null);
+
+  const [resultsJson, setResultsJson] = useState<ResultsJson | null>(null);
+  const [resultsJsonUrl, setResultsJsonUrl] = useState<string | null>(null);
 
   const statusClass = job.status ? `status-pill ${job.status.toLowerCase()}` : 'status-pill unknown';
 
@@ -44,8 +58,11 @@ export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
     try {
       setResultLoading(true);
       setResultError(null);
-      const response = await fetchResultLink(job.jobId);
-      setResultUrl(response.downloadUrl);
+      // Prefer parsed results (for inline viewer) but also keep the raw link
+      const { meta, json } = await fetchResultsJson(job.jobId);
+      setResultsJson(json);
+      setResultsJsonUrl(meta.downloadUrl);
+      setResultUrl(meta.downloadUrl);
     } catch (error) {
       console.error('Failed to fetch results', error);
       setResultError(error instanceof Error ? error.message : 'Unable to fetch results');
@@ -53,6 +70,14 @@ export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
       setResultLoading(false);
     }
   };
+
+  // Auto-load results once the job succeeds
+  useEffect(() => {
+    if (job.status === 'SUCCEEDED' && !resultsJson && !resultLoading) {
+      handleFetchResults().catch(() => void 0);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job.status]);
 
   const created = job.createdAt ? new Date(job.createdAt * 1000) : null;
   const updated = job.updatedAt ? new Date(job.updatedAt * 1000) : null;
@@ -95,12 +120,12 @@ export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
           {showManifest ? 'Hide manifest' : 'View manifest'}
         </button>
         <button type="button" className="primary" onClick={handleFetchResults} disabled={resultLoading}>
-          {resultLoading ? 'Fetching…' : 'Get results link'}
+          {resultLoading ? 'Fetching…' : resultsJson ? 'Refresh results' : 'Open results'}
         </button>
       </section>
 
       {resultError && <div className="banner danger">{resultError}</div>}
-      {resultUrl && (
+      {resultUrl && !resultsJson && (
         <div className="banner success">
           <a href={resultUrl} target="_blank" rel="noreferrer">
             Download results
@@ -112,15 +137,19 @@ export function JobCard({ job, onRefresh, onRemove }: JobCardProps) {
         <section className="manifest-viewer">
           {manifestLoading && <p className="loading">Loading manifest…</p>}
           {manifestError && <div className="banner danger">{manifestError}</div>}
-          {manifest && !manifestLoading && (
-            <ManifestPreview jobId={job.jobId} manifest={manifest} />
-          )}
+          {manifest && !manifestLoading && <ManifestPreview jobId={job.jobId} manifest={manifest} />}
         </section>
       )}
 
       {showArtifacts && (
         <section className="artifact-section">
           <ArtifactBrowser jobId={job.jobId} />
+        </section>
+      )}
+
+      {resultsJson && (
+        <section className="results-view">
+          <ResultsViewer jobId={job.jobId} data={resultsJson} downloadUrl={resultsJsonUrl} />
         </section>
       )}
     </article>

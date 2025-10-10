@@ -17,6 +17,9 @@ ddb = boto3.resource("dynamodb")
 TABLE_NAME = os.environ["JOBS_TABLE"]
 ARTIFACTS_BUCKET = os.environ.get("ARTIFACTS_BUCKET")
 
+ANALYSIS_VERSION = "TEST-2025-10-09"
+
+
 STATUS_RUNNING = "RUNNING"
 STATUS_SUCCEEDED = "SUCCEEDED"
 STATUS_FAILED = "FAILED"
@@ -200,6 +203,37 @@ def _build_schema_from_profile(profile_phase: Mapping[str, Any]) -> List[Dict[st
     return schema
 
 
+def _emit_parse_debug(job_id: str, bucket: str, profile_phase: Mapping[str, Any]) -> Optional[str]:
+    """
+    Write a tiny debug artifact so we can see what the parser actually produced.
+    Looks for common keys emitted by a profiler node.
+    """
+    try:
+        debug: Dict[str, Any] = {}
+        # shape / dtypes
+        shape = profile_phase.get("shape")
+        if isinstance(shape, Mapping):
+            debug["shape"] = {k: int(v) for k, v in shape.items() if isinstance(v, int)}
+        dtypes = profile_phase.get("dtypes")
+        if isinstance(dtypes, Mapping):
+            debug["dtypes"] = {str(k): str(v) for k, v in dtypes.items()}
+        # head preview
+        head = profile_phase.get("head")
+        if isinstance(head, list):
+            debug["head"] = head[:3]
+        # fallback: column names
+        cols = profile_phase.get("columnProfiles")
+        if isinstance(cols, list):
+            debug["columnNames"] = [
+                str(c.get("name")) for c in cols if isinstance(c, Mapping) and c.get("name")
+            ][:50]
+        key = artifact_key_for(job_id, "results/parse_debug.json")
+        _put_object(bucket, key, _json_bytes(debug), "application/json")
+        return key
+    except Exception:
+        return None
+
+
 def build_results_payload(
     job_id: str,
     result: PipelineResult,
@@ -208,9 +242,57 @@ def build_results_payload(
     artifact_bucket: Optional[str] = None,
 ) -> Dict[str, Any]:
     metrics = dict(result.metrics)
+    profile_phase = result.phases.get("profile", {}) or {}
+
+    # Build schema BEFORE summary so we can use it for robust fallbacks
+    schema = _build_schema_from_profile(profile_phase)
+
+    # Best-effort fallbacks for rows/columns (avoid numeric-only mistakes)
+    def _rows_fallback() -> Optional[int]:
+        # common shapes produced by profilers
+        for k in ("rowCount", "rows", "nRows", "shapeRows"):
+            v = profile_phase.get(k)
+            if isinstance(v, int) and v >= 0:
+                return v
+        # sometimes embedded under "shape" or "metrics"
+        shp = profile_phase.get("shape")
+        if isinstance(shp, Mapping) and isinstance(shp.get("rows"), int):
+            return shp["rows"]
+        m = profile_phase.get("metrics")
+        if isinstance(m, Mapping) and isinstance(m.get("rows"), int):
+            return m["rows"]
+        return None
+
+    def _cols_fallback() -> Optional[int]:
+        # most reliable: the length of the built schema
+        if schema:
+            return len(schema)
+        for k in ("columnCount", "columns", "nCols", "shapeCols"):
+            v = profile_phase.get(k)
+            if isinstance(v, int) and v >= 0:
+                return v
+        shp = profile_phase.get("shape")
+        if isinstance(shp, Mapping) and isinstance(shp.get("columns"), int):
+            return shp["columns"]
+        cols = profile_phase.get("columnProfiles")
+        if isinstance(cols, list):
+            return len(cols)
+        return None
+
+    rows_val = metrics.get("rows")
+    cols_val = metrics.get("columns")
+    if not isinstance(rows_val, int):
+        fb = _rows_fallback()
+        if isinstance(fb, int):
+            rows_val = fb
+    if not isinstance(cols_val, int):
+        fb = _cols_fallback()
+        if isinstance(fb, int):
+            cols_val = fb
+
     summary = {
-        "rows": metrics.get("rows"),
-        "columns": metrics.get("columns"),
+        "rows": rows_val,
+        "columns": cols_val,
         "bytesRead": metrics.get("bytesRead"),
         "datasetCompleteness": metrics.get("datasetCompleteness"),
         "dqScore": metrics.get("dqScore"),
@@ -230,14 +312,12 @@ def build_results_payload(
         links["resultsManifest"] = manifest_uri
         links["resultsJson"] = results_uri
 
-    profile_phase = result.phases.get("profile", {})
-
     payload = {
         "jobId": job_id,
         "analysisVersion": ANALYSIS_VERSION,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "summary": summary,
-        "schema": _build_schema_from_profile(profile_phase),
+        "schema": schema,
         "links": links,
         "phases": result.phases,
         "metrics": metrics,
@@ -307,6 +387,13 @@ def main(event, _ctx):
             source_input=payload_input,
             artifact_bucket=target_bucket,
         )
+
+        # Best-effort parse debug to aid troubleshooting
+        try:
+            _emit_parse_debug(job_id, target_bucket, result.phases.get("profile", {}) or {})
+        except Exception:
+            pass
+
         _put_object(target_bucket, results_key, _json_bytes(results_payload), "application/json")
 
         try:

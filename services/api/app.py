@@ -552,33 +552,12 @@ def presign_any(job_id: str, key: str = Query(..., description="Full S3 key insi
 @app.post("/jobs/{job_id}/process")
 def process_now(job_id: str):
     """
-    Emits the structure described in the Result Package Overview:
-
-    artifacts/{jobId}/
-      manifest.json
-      phases/
-        01_ingest.json
-        02_profiling.json
-        03_quality.json
-        04_descriptives.json
-        05_narrative.json
-        99_finalize.json
-      results/
-        results.json
-        manifest.json
-        descriptive_stats.csv
-        descriptiveTable.json
-        correlations.csv
-        outliers.json
-        report.html
-        report.txt
-        graphs/
-          hist_1.png
-          scatter_1.png
-        bundles/
-          analytics_bundle.zip
-          visualizations.zip
+    Dev/manual processor that infers CSV shape, writes phases/*, and results/*.
+    Produces correct rows/columns/schema and real descriptive stats/correlations/outliers.
     """
+    import csv
+    from collections import Counter
+
     job = ensure_job(job_id)
     src = job.get("source") or {}
     bucket = src.get("bucket")
@@ -588,131 +567,324 @@ def process_now(job_id: str):
 
     ddb_update_status(job_id, "RUNNING")
     now_iso = datetime.now(timezone.utc).isoformat()
+    base = f"artifacts/{job_id}"
 
-    try:
-        # --- Read input to compute basic stats (demo) ---
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        body_stream = obj["Body"]
-        line_count = 0
-        data_bytes = 0
-        for chunk in iter(lambda: body_stream.read(1024 * 1024), b""):
-            line_count += chunk.count(b"\n")
-            data_bytes += len(chunk)
-        if data_bytes > 0:
-            line_count = max(1, line_count)
-        rows = max(0, line_count - 1)
-        columns = 2  # demo; a real pipeline should infer
+    # --- Read entire object (ok for small CSVs; switch to chunking if needed)
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    raw = obj["Body"].read()
+    data_bytes = len(raw)
 
-        base = f"artifacts/{job_id}"
+    # --- Decode (handle BOM) ---
+    text = raw.decode("utf-8-sig", errors="ignore")
 
-        # --- Phase files ---
-        phases = [
-            ("01_ingest.json", {
-                "phase": "ingest",
-                "input": {"bucket": bucket, "key": key, "bytes": data_bytes},
-                "status": "completed", "at": now_iso,
-            }),
-            ("02_profiling.json", {
-                "phase": "profiling",
-                "summary": {"rows": rows, "columns": columns},
-                "status": "completed", "at": now_iso,
-            }),
-            ("03_quality.json", {
-                "phase": "data_quality",
-                "checks": [{"name": "non_empty", "status": "pass"}],
-                "status": "completed", "at": now_iso,
-            }),
-            ("04_descriptives.json", {
-                "phase": "descriptive_stats",
-                "tables": [{"name": "descriptive_stats", "path": f"s3://{BUCKET_NAME}/{base}/results/descriptive_stats.csv"}],
-                "status": "completed", "at": now_iso,
-            }),
-            ("05_narrative.json", {
-                "phase": "nl_report",
-                "highlights": [
-                    f"Dataset has {rows} rows and {columns} columns.",
-                    "Strongest correlations and potential outliers summarized in report.",
-                ],
-                "status": "completed", "at": now_iso,
-            }),
-            ("99_finalize.json", {"phase": "finalization", "status": "completed", "at": now_iso}),
-        ]
-        for fname, payload in phases:
-            s3.put_object(
-                Bucket=BUCKET_NAME,
-                Key=f"{base}/phases/{fname}",
-                Body=json.dumps(payload, indent=2).encode("utf-8"),
-                ContentType="application/json",
-            )
+    rows = 0
+    columns = 0
+    header: List[str] = []
+    data_rows: List[List[str]] = []
+    data_rows_preview: List[List[str]] = []
+    inferred_types: List[str] = []
+    delimiter: Optional[str] = None
 
-        # --- Top-level manifest (dev/debug) ---
-        manifest = {
-            "jobId": job_id,
-            "generatedAt": now_iso,
-            "input": {"bucket": bucket, "key": key, "bytes": data_bytes},
-            "phases": [f"s3://{BUCKET_NAME}/{base}/phases/{n}" for (n, _) in phases],
+    if text:
+        # --- Sniff delimiter & parse header ---
+        sample = text[:64 * 1024]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=[",",";","\t","|"])
+            delimiter = dialect.delimiter
+        except Exception:
+            # fallback: choose the most common likely delimiter in the sample
+            cand = Counter([c for c in sample if c in ",;\t|"]).most_common(1)
+            delimiter = cand[0][0] if cand else ","
+
+        reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+        rows_list = list(reader)
+
+        if rows_list:
+            header = rows_list[0]
+            data_rows = rows_list[1:]
+        else:
+            header = []
+            data_rows = []
+
+        columns = len(header)
+
+        # Trim empty trailing lines that parsed as []
+        data_rows = [r for r in data_rows if any((cell or "").strip() != "" for cell in r)]
+        rows = len(data_rows)
+
+        # --- normalize ragged rows & header padding ---
+        max_len = max([columns] + [len(r) for r in data_rows]) if data_rows else columns
+        if columns < max_len and header:
+            header = header + [f"col_{i}" for i in range(columns+1, max_len+1)]
+            columns = max_len
+            # also pad each data row to the same length (for safe indexing below)
+            data_rows = [r + [""] * (columns - len(r)) for r in data_rows]
+
+        # Preview a few rows
+        data_rows_preview = data_rows[:3]
+
+        # --- Light type inference per column (sample up to 200 rows) ---
+        def infer_type(values: List[str]) -> str:
+            num_hits = 0
+            non_empty = 0
+            for v in values:
+                v = (v or "").strip()
+                if not v:
+                    continue
+                non_empty += 1
+                try:
+                    float(v.replace(",", ""))  # tolerate 1,234.5
+                    num_hits += 1
+                except Exception:
+                    pass
+            if non_empty > 0 and num_hits / non_empty >= 0.8:
+                return "number"
+            return "string"
+
+        sample_n = min(200, len(data_rows))
+        col_samples: List[List[str]] = [[] for _ in range(columns)]
+        for r in data_rows[:sample_n]:
+            for i in range(columns):
+                col_samples[i].append(r[i] if i < len(r) else "")
+
+        inferred_types = [infer_type(vals) for vals in col_samples] if columns else []
+
+    # --- Build phases/* payloads ---
+    profiling_payload = {
+        "phase": "profiling",
+        "status": "completed",
+        "at": now_iso,
+        "shape": {"rows": rows, "columns": columns},
+        "delimiter": delimiter if text else None,
+        "head": [dict(zip(header, r + [""] * (len(header) - len(r)))) for r in data_rows_preview] if header else [],
+        "columnProfiles": [
+            {
+                "name": (name if (name and str(name).strip()) else f"col_{i+1}"),
+                "inferredType": inferred_types[i] if i < len(inferred_types) else "string",
+            }
+            for i, name in enumerate(header)
+        ],
+    }
+
+    ingest_payload = {
+        "phase": "ingest",
+        "input": {"bucket": bucket, "key": key, "bytes": data_bytes},
+        "status": "completed",
+        "at": now_iso,
+    }
+    quality_payload = {
+        "phase": "data_quality",
+        "checks": [{"name": "non_empty", "status": "pass" if rows > 0 and columns > 0 else "fail"}],
+        "status": "completed",
+        "at": now_iso,
+    }
+    descriptives_payload = {
+        "phase": "descriptive_stats",
+        "tables": [{"name": "descriptive_stats", "path": f"s3://{BUCKET_NAME}/{base}/results/descriptive_stats.csv"}],
+        "status": "completed",
+        "at": now_iso,
+    }
+    narrative_payload = {
+        "phase": "nl_report",
+        "highlights": [
+            f"Dataset has {rows} rows and {columns} columns.",
+            "Basic profile generated from header, delimiter inference, and sampling.",
+        ],
+        "status": "completed",
+        "at": now_iso,
+    }
+    finalize_payload = {"phase": "finalization", "status": "completed", "at": now_iso}
+
+    # --- Write phases/*
+    phases = [
+        ("01_ingest.json", ingest_payload),
+        ("02_profiling.json", profiling_payload),
+        ("03_quality.json", quality_payload),
+        ("04_descriptives.json", descriptives_payload),
+        ("05_narrative.json", narrative_payload),
+        ("99_finalize.json", finalize_payload),
+    ]
+    for fname, payload in phases:
+        s3.put_object(
+            Bucket=BUCKET_NAME,
+            Key=f"{base}/phases/{fname}",
+            Body=json.dumps(payload, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+
+    # --- Top-level manifest
+    manifest = {
+        "jobId": job_id,
+        "generatedAt": now_iso,
+        "input": {"bucket": bucket, "key": key, "bytes": data_bytes},
+        "phases": [f"s3://{BUCKET_NAME}/{base}/phases/{n}" for (n, _) in phases],
+    }
+    s3.put_object(
+        Bucket=BUCKET_NAME,
+        Key=f"{base}/manifest.json",
+        Body=json.dumps(manifest, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+    # =========================
+    # REAL DESCRIPTIVE STATS
+    # =========================
+    def _to_float(s: str) -> Optional[float]:
+        if s is None:
+            return None
+        s = s.strip()
+        if s == "":
+            return None
+        try:
+            return float(s.replace(",", ""))
+        except Exception:
+            return None
+
+    # Choose numeric columns based on inferred types
+    col_names = [c["name"] for c in profiling_payload.get("columnProfiles", [])]
+    num_indices = [i for i, c in enumerate(profiling_payload.get("columnProfiles", []))
+                   if (isinstance(c, dict) and c.get("inferredType") == "number")]
+    num_names = [col_names[i] for i in num_indices]
+
+    # Materialize numeric columns
+    col_values: List[List[float]] = [[] for _ in num_indices]
+    for r in data_rows:
+        for j, col_idx in enumerate(num_indices):
+            v = _to_float(r[col_idx] if col_idx < len(r) else None)
+            if v is not None:
+                col_values[j].append(v)
+
+    def _quantile(sorted_vals: List[float], q: float) -> Optional[float]:
+        if not sorted_vals:
+            return None
+        if q <= 0: return sorted_vals[0]
+        if q >= 1: return sorted_vals[-1]
+        pos = q * (len(sorted_vals) - 1)
+        lo = int(pos)
+        hi = min(lo + 1, len(sorted_vals) - 1)
+        frac = pos - lo
+        return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
+
+    def _stats(vals: List[float]) -> dict:
+        n = len(vals)
+        if n == 0:
+            return {"count": 0, "mean": None, "std": None, "min": None, "p5": None, "p25": None,
+                    "p50": None, "p75": None, "p95": None, "max": None}
+        s = sum(vals)
+        mean = s / n
+        if n > 1:
+            var = sum((x - mean) ** 2 for x in vals) / (n - 1)  # sample variance
+            std = var ** 0.5
+        else:
+            std = 0.0
+        sv = sorted(vals)
+        return {
+            "count": n,
+            "mean": mean,
+            "std": std,
+            "min": sv[0],
+            "p5":  _quantile(sv, 0.05),
+            "p25": _quantile(sv, 0.25),
+            "p50": _quantile(sv, 0.50),
+            "p75": _quantile(sv, 0.75),
+            "p95": _quantile(sv, 0.95),
+            "max": sv[-1],
         }
-        s3.put_object(
-            Bucket=BUCKET_NAME,
-            Key=f"{base}/manifest.json",
-            Body=json.dumps(manifest, indent=2).encode("utf-8"),
-            ContentType="application/json",
-        )
 
-        # --- Results: descriptive_stats.csv (demo single-row per column) ---
-        desc_csv = [
-            "column,count,mean,std,min,p5,p25,p50,p75,p95,max",
-            "a,100,50.0,10.0,10,20,40,50,60,80,90",
-            "b,100,25.0,5.0,5,10,20,25,30,40,45",
-        ]
-        s3.put_object(
-            Bucket=BUCKET_NAME,
-            Key=f"{base}/results/descriptive_stats.csv",
-            Body=("\n".join(desc_csv) + "\n").encode("utf-8"),
-            ContentType="text/csv",
-        )
-        # JSON version for in-app rendering convenience
-        s3.put_object(
-            Bucket=BUCKET_NAME,
-            Key=f"{base}/results/descriptiveTable.json",
-            Body=json.dumps({
-                "columns": ["column","count","mean","std","min","p5","p25","p50","p75","p95","max"],
-                "rows": [
-                    {"column":"a","count":100,"mean":50.0,"std":10.0,"min":10,"p5":20,"p25":40,"p50":50,"p75":60,"p95":80,"max":90},
-                    {"column":"b","count":100,"mean":25.0,"std":5.0,"min":5,"p5":10,"p25":20,"p50":25,"p75":30,"p95":40,"max":45},
-                ]
-            }, indent=2).encode("utf-8"),
-            ContentType="application/json",
-        )
+    # Build descriptive table rows
+    desc_rows = []
+    for name, vals in zip(num_names, col_values):
+        st = _stats(vals)
+        desc_rows.append({"column": name, **st})
 
-        # --- Results: correlations.csv ---
-        corr_csv = [
-            "feature_x,feature_y,pearson_r,n",
-            "a,b,0.71,100",
-        ]
-        s3.put_object(
-            Bucket=BUCKET_NAME,
-            Key=f"{base}/results/correlations.csv",
-            Body=("\n".join(corr_csv) + "\n").encode("utf-8"),
-            ContentType="text/csv",
-        )
+    # Write descriptive_stats.csv
+    desc_header = ["column","count","mean","std","min","p5","p25","p50","p75","p95","max"]
+    def _fmt(x):
+        if x is None: return ""
+        if isinstance(x, float):
+            return f"{x:.6g}"
+        return str(x)
+    out_lines = [",".join(desc_header)]
+    for row in desc_rows:
+        out_lines.append(",".join(_fmt(row[h]) for h in desc_header))
+    s3.put_object(
+        Bucket=BUCKET_NAME,
+        Key=f"{base}/results/descriptive_stats.csv",
+        Body=("\n".join(out_lines) + "\n").encode("utf-8"),
+        ContentType="text/csv",
+    )
 
-        # --- Results: outliers.json (z-score demo) ---
-        s3.put_object(
-            Bucket=BUCKET_NAME,
-            Key=f"{base}/results/outliers.json",
-            Body=json.dumps({
-                "method":"zscore","threshold":3.0,
-                "findings":[
-                    {"column":"a","value":90,"z":3.2,"index":92},
-                    {"column":"b","value":45,"z":3.1,"index":77},
-                ]
-            }, indent=2).encode("utf-8"),
-            ContentType="application/json",
-        )
+    # JSON version for UI
+    s3.put_object(
+        Bucket=BUCKET_NAME,
+        Key=f"{base}/results/descriptiveTable.json",
+        Body=json.dumps({"columns": desc_header, "rows": desc_rows}, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
 
-        # --- Report (HTML + TXT) ---
-        html = f"""<!doctype html>
+    # --- Real correlations (top pairs by |r|)
+    def _pearson(x: List[float], y: List[float]) -> Optional[float]:
+        n = min(len(x), len(y))
+        if n < 2:
+            return None
+        mx = sum(x[:n]) / n
+        my = sum(y[:n]) / n
+        num = sum((x[i]-mx)*(y[i]-my) for i in range(n))
+        denx = sum((x[i]-mx)**2 for i in range(n)) ** 0.5
+        deny = sum((y[i]-my)**2 for i in range(n)) ** 0.5
+        if denx == 0 or deny == 0:
+            return None
+        return num / (denx * deny)
+
+    corr_rows: List[dict] = []
+    for a_i in range(len(num_names)):
+        for b_i in range(a_i + 1, len(num_names)):
+            A, B = [], []
+            col_a = num_indices[a_i]
+            col_b = num_indices[b_i]
+            for r in data_rows:
+                va = _to_float(r[col_a] if col_a < len(r) else None)
+                vb = _to_float(r[col_b] if col_b < len(r) else None)
+                if va is not None and vb is not None:
+                    A.append(va); B.append(vb)
+            r_val = _pearson(A, B)
+            if r_val is not None:
+                corr_rows.append({"feature_x": num_names[a_i], "feature_y": num_names[b_i], "pearson_r": r_val, "n": len(A)})
+
+    corr_rows.sort(key=lambda d: abs(d["pearson_r"]), reverse=True)
+    corr_rows = corr_rows[:100]
+    corr_header = ["feature_x","feature_y","pearson_r","n"]
+    corr_lines = [",".join(corr_header)]
+    for row in corr_rows:
+        corr_lines.append(",".join([row["feature_x"], row["feature_y"], _fmt(row["pearson_r"]), str(row["n"])]))
+    s3.put_object(
+        Bucket=BUCKET_NAME,
+        Key=f"{base}/results/correlations.csv",
+        Body=("\n".join(corr_lines) + "\n").encode("utf-8"),
+        ContentType="text/csv",
+    )
+
+    # --- Outliers: simple z-score >= 3 per numeric column
+    out_findings = []
+    for name, vals in zip(num_names, col_values):
+        st = _stats(vals)
+        n = st["count"]
+        mu = st["mean"]; sd = st["std"]
+        if n >= 3 and sd and sd > 0:
+            for v in vals:
+                z = (v - mu) / sd
+                if abs(z) >= 3:
+                    out_findings.append({"column": name, "value": v, "z": z})
+    out_findings = sorted(out_findings, key=lambda d: abs(d["z"]), reverse=True)[:50]
+    s3.put_object(
+        Bucket=BUCKET_NAME,
+        Key=f"{base}/results/outliers.json",
+        Body=json.dumps({"method":"zscore","threshold":3.0,"findings": out_findings}, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+    # --- Report
+    html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>MetricFoundry Report</title>
 <style>body{{font-family:ui-sans-serif,system-ui;max-width:920px;margin:24px auto;padding:0 16px}}
 h1{{font-size:22px}} .kpi{{display:inline-block;margin-right:16px;padding:8px 12px;border:1px solid #ddd;border-radius:10px}}</style></head>
@@ -721,107 +893,67 @@ h1{{font-size:22px}} .kpi{{display:inline-block;margin-right:16px;padding:8px 12
   <div class="kpi">Rows: <b>{rows}</b></div>
   <div class="kpi">Columns: <b>{columns}</b></div>
   <p>Generated: {now_iso}</p>
-  <p><b>Highlights:</b> strongest correlation a↔b (r≈0.71); 2 potential outliers found (z≥3).</p>
+  <p><b>Highlights:</b> Real stats computed from numeric columns; correlations and potential outliers included.</p>
 </body></html>"""
-        s3.put_object(
-            Bucket=BUCKET_NAME,
-            Key=f"{base}/results/report.html",
-            Body=html.encode("utf-8"),
-            ContentType="text/html",
-        )
-        s3.put_object(
-            Bucket=BUCKET_NAME,
-            Key=f"{base}/results/report.txt",
-            Body=f"Job {job_id}\nRows: {rows}\nColumns: {columns}\nGenerated: {now_iso}\n".encode("utf-8"),
-            ContentType="text/plain",
-        )
+    s3.put_object(Bucket=BUCKET_NAME, Key=f"{base}/results/report.html", Body=html.encode("utf-8"), ContentType="text/html")
+    s3.put_object(Bucket=BUCKET_NAME, Key=f"{base}/results/report.txt", Body=f"Job {job_id}\nRows: {rows}\nColumns: {columns}\nGenerated: {now_iso}\n".encode("utf-8"), ContentType="text/plain")
 
-        # --- Graphs (PNG stubs) ---
-        png_stub = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x05\x00\x00\x00\x05\x08\x06\x00\x00\x00\x8d\x89\x1d\r\x00\x00\x00\x0cIDATx\x9ccddbf\xa0\x040\x00\x00\x05\x00\x01\x9b\xc7\x19\xd3\x00\x00\x00\x00IEND\xaeB`\x82"
-        s3.put_object(Bucket=BUCKET_NAME, Key=f"{base}/results/graphs/hist_1.png", Body=png_stub, ContentType="image/png")
-        s3.put_object(Bucket=BUCKET_NAME, Key=f"{base}/results/graphs/scatter_1.png", Body=png_stub, ContentType="image/png")
+    # --- Graphs (PNG stubs kept)
+    png_stub = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x05\x00\x00\x00\x05\x08\x06\x00\x00\x00\x8d\x89\x1d\r\x00\x00\x00\x0cIDATx\x9ccddbf\xa0\x040\x00\x00\x05\x00\x01\x9b\xc7\x19\xd3\x00\x00\x00\x00IEND\xaeB`\x82"
+    s3.put_object(Bucket=BUCKET_NAME, Key=f"{base}/results/graphs/hist_1.png", Body=png_stub, ContentType="image/png")
+    s3.put_object(Bucket=BUCKET_NAME, Key=f"{base}/results/graphs/scatter_1.png", Body=png_stub, ContentType="image/png")
 
-        # --- Results manifest (enumerate user-facing deliverables) ---
-        results_manifest = {
-            "jobId": job_id,
-            "generatedAt": now_iso,
-            "artifacts": [
-                {"key": f"{base}/results/descriptive_stats.csv", "contentType":"text/csv"},
-                {"key": f"{base}/results/descriptiveTable.json", "contentType":"application/json"},
-                {"key": f"{base}/results/correlations.csv", "contentType":"text/csv"},
-                {"key": f"{base}/results/outliers.json", "contentType":"application/json"},
-                {"key": f"{base}/results/report.html", "contentType":"text/html"},
-                {"key": f"{base}/results/report.txt", "contentType":"text/plain"},
-                {"key": f"{base}/results/graphs/hist_1.png", "contentType":"image/png"},
-                {"key": f"{base}/results/graphs/scatter_1.png", "contentType":"image/png"},
-            ]
+    # --- Results manifest
+    results_manifest = {
+        "jobId": job_id,
+        "generatedAt": now_iso,
+        "artifacts": [
+            {"key": f"{base}/results/descriptive_stats.csv", "contentType":"text/csv"},
+            {"key": f"{base}/results/descriptiveTable.json", "contentType":"application/json"},
+            {"key": f"{base}/results/correlations.csv", "contentType":"text/csv"},
+            {"key": f"{base}/results/outliers.json", "contentType":"application/json"},
+            {"key": f"{base}/results/report.html", "contentType":"text/html"},
+            {"key": f"{base}/results/report.txt", "contentType":"text/plain"},
+            {"key": f"{base}/results/graphs/hist_1.png", "contentType":"image/png"},
+            {"key": f"{base}/results/graphs/scatter_1.png", "contentType":"image/png"},
+        ]
+    }
+    s3.put_object(Bucket=BUCKET_NAME, Key=f"{base}/results/manifest.json", Body=json.dumps(results_manifest, indent=2).encode("utf-8"), ContentType="application/json")
+
+    # --- parse_debug.json (for easy troubleshooting)
+    try:
+        parse_debug = {
+            "shape": {"rows": rows, "columns": columns},
+            "delimiter": profiling_payload.get("delimiter"),
+            "firstHeader": header[:20] if text else [],
+            "head": profiling_payload.get("head", []),
         }
-        s3.put_object(
-            Bucket=BUCKET_NAME,
-            Key=f"{base}/results/manifest.json",
-            Body=json.dumps(results_manifest, indent=2).encode("utf-8"),
-            ContentType="application/json",
-        )
+        s3.put_object(Bucket=BUCKET_NAME, Key=f"{base}/results/parse_debug.json", Body=json.dumps(parse_debug, indent=2).encode("utf-8"), ContentType="application/json")
+    except Exception:
+        pass
 
-        # --- results.json (canonical API summary) ---
-        results_json = {
-            "jobId": job_id,
-            "summary": {"rows": rows, "columns": columns},
-            "links": {
-                "manifest": f"s3://{BUCKET_NAME}/{base}/manifest.json",
-                "resultsManifest": f"s3://{BUCKET_NAME}/{base}/results/manifest.json",
-                "input": f"s3://{bucket}/{key}",
-                "reportHtml": f"s3://{BUCKET_NAME}/{base}/results/report.html",
-            },
-            "generatedAt": now_iso,
-        }
-        s3.put_object(
-            Bucket=BUCKET_NAME,
-            Key=f"{base}/results/results.json",
-            Body=json.dumps(results_json, indent=2).encode("utf-8"),
-            ContentType="application/json",
-        )
+    # --- results.json (canonical API summary) with schema + analysisVersion
+    schema = profiling_payload.get("columnProfiles") or []
+    results_json = {
+        "jobId": job_id,
+        "analysisVersion": "2025.10-dev",
+        "generatedAt": now_iso,
+        "summary": {"rows": rows, "columns": columns},
+        "schema": [{"name": c["name"], "type": c.get("inferredType")} for c in schema],
+        "links": {
+            "manifest": f"s3://{BUCKET_NAME}/{base}/manifest.json",
+            "resultsManifest": f"s3://{BUCKET_NAME}/{base}/results/manifest.json",
+            "resultsJson": f"s3://{BUCKET_NAME}/{base}/results/results.json",
+            "input": f"s3://{bucket}/{key}",
+            "reportHtml": f"s3://{BUCKET_NAME}/{base}/results/report.html",
+        },
+    }
+    s3.put_object(Bucket=BUCKET_NAME, Key=f"{base}/results/results.json", Body=json.dumps(results_json, indent=2).encode("utf-8"), ContentType="application/json")
 
-        # --- Bundles (analytics + visualizations) ---
-        # analytics_bundle.zip: CSV/JSON diagnostics
-        mem = io.BytesIO()
-        with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("descriptive_stats.csv", "\n".join(desc_csv) + "\n")
-            zf.writestr("correlations.csv", "\n".join(corr_csv) + "\n")
-            zf.writestr("outliers.json", json.dumps({
-                "method":"zscore","threshold":3.0,"findings":[
-                    {"column":"a","value":90,"z":3.2,"index":92},
-                    {"column":"b","value":45,"z":3.1,"index":77},
-                ]
-            }, indent=2))
-        mem.seek(0)
-        s3.put_object(
-            Bucket=BUCKET_NAME,
-            Key=f"{base}/results/bundles/analytics_bundle.zip",
-            Body=mem.read(),
-            ContentType="application/zip",
-        )
-
-        # visualizations.zip: PNG graphs
-        mem2 = io.BytesIO()
-        with zipfile.ZipFile(mem2, mode="w", compression=zipfile.ZIP_DEFLATED) as zf2:
-            zf2.writestr("graphs/hist_1.png", png_stub)
-            zf2.writestr("graphs/scatter_1.png", png_stub)
-        mem2.seek(0)
-        s3.put_object(
-            Bucket=BUCKET_NAME,
-            Key=f"{base}/results/bundles/visualizations.zip",
-            Body=mem2.read(),
-            ContentType="application/zip",
-        )
-
-        # success
-        results_key = f"{base}/results/results.json"
-        ddb_update_status(job_id, "SUCCEEDED", resultKey=results_key)
-        return {"ok": True, "resultKey": results_key}
-    except Exception as e:
-        ddb_update_status(job_id, "FAILED", error=str(e)[:1000])
-        raise
+    # success
+    results_key = f"{base}/results/results.json"
+    ddb_update_status(job_id, "SUCCEEDED", resultKey=results_key)
+    return {"ok": True, "resultKey": results_key}
 
 
 # ---- Middleware ----
@@ -851,8 +983,8 @@ async def log_requests(request: Request, call_next):
             extra={
                 "path": request.url.path,
                 "method": request.method,
-                "duration_ms": duration_ms,
                 "request_id": request_id,
+                "duration_ms": duration_ms,
             },
         )
         raise
