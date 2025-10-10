@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -140,19 +141,41 @@ def _build_sql_connection(config: Dict[str, object], *, source_label: str) -> Di
     return payload
 
 
+_FILENAME_PATTERN = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _sanitize_upload_filename(filename: str) -> str:
+    base = os.path.basename(filename)
+    candidate = _FILENAME_PATTERN.sub("_", base.strip())[:128]
+    candidate = candidate.lstrip("._")
+    while ".." in candidate:
+        candidate = candidate.replace("..", ".")
+    if not candidate or set(candidate) == {"."}:
+        return "upload.csv"
+    return candidate
+
+
 def _build_source(body: CreateJob, job_id: str) -> Tuple[dict, Optional[str]]:
     """Return (source_metadata, upload_url?)."""
     source_type = body.source_type
     config = _clean_config(body.source_config)
 
     if source_type == "upload":
-        key = f"artifacts/{job_id}/input/upload.csv"
+        filename_raw = str(config.get("filename") or config.get("fileName") or "upload.csv")
+        filename = _sanitize_upload_filename(filename_raw)
+        key = f"artifacts/{job_id}/input/{filename}"
+        content_type = config.get("contentType") or config.get("content_type")
+        params: Dict[str, Any] = {"Bucket": BUCKET_NAME, "Key": key}
+        if content_type:
+            params["ContentType"] = str(content_type)
         upload_url = s3.generate_presigned_url(
             ClientMethod="put_object",
-            Params={"Bucket": BUCKET_NAME, "Key": key, "ContentType": "text/csv"},
+            Params=params,
             ExpiresIn=900,
         )
-        source = {"type": "upload", "bucket": BUCKET_NAME, "key": key}
+        source = {"type": "upload", "bucket": BUCKET_NAME, "key": key, "filename": filename}
+        if content_type:
+            source["contentType"] = str(content_type)
         return source, upload_url
 
     if source_type == "s3":

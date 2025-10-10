@@ -91,6 +91,7 @@ class FakeTable:
 class FakeS3:
     def __init__(self) -> None:
         self._objects: Dict[str, Dict[str, Dict[str, object]]] = {}
+        self.presigned: List[Dict[str, object]] = []
 
     def _bucket(self, name: str) -> Dict[str, Dict[str, object]]:
         return self._objects.setdefault(name, {})
@@ -112,6 +113,8 @@ class FakeS3:
         return {"ResponseMetadata": {"HTTPStatusCode": 200}}
 
     def generate_presigned_url(self, ClientMethod: str, Params: Dict[str, str], ExpiresIn: int):  # noqa: N803 - mimic boto3 casing
+        record = {"ClientMethod": ClientMethod, "Params": dict(Params), "ExpiresIn": ExpiresIn}
+        self.presigned.append(record)
         return f"https://example.com/{Params['Key']}?expires={ExpiresIn}&method={ClientMethod}"
 
     def list_objects_v2(self, Bucket: str, Prefix: str, MaxKeys: int, Delimiter: Optional[str] = "/", **_: object):  # noqa: N803
@@ -297,6 +300,51 @@ def test_create_job_enqueues_state_machine(api_app):
     metric_names = [metric["MetricName"] for metric in cloudwatch.metrics]
     assert "JobQueued" in metric_names
     assert "JobCreated" in metric_names
+
+
+def test_create_job_honours_filename_and_content_type(api_app):
+    client, module, s3, table, sfn, _cloudwatch = api_app
+
+    response = client.post(
+        "/jobs",
+        json={
+            "source_type": "upload",
+            "source_config": {
+                "filename": "../My Data.PARQUET",
+                "contentType": "application/octet-stream",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    key = payload["source"]["key"]
+    assert key.endswith("/input/My_Data.PARQUET")
+    assert payload["source"]["filename"] == "My_Data.PARQUET"
+    assert payload["source"]["contentType"] == "application/octet-stream"
+
+    presign_first = s3.presigned[-1]
+    assert presign_first["Params"]["Key"] == key
+    assert presign_first["Params"]["ContentType"] == "application/octet-stream"
+
+    response_no_type = client.post(
+        "/jobs",
+        json={"source_type": "upload", "source_config": {"filename": " spaces..jsonl "}},
+    )
+
+    assert response_no_type.status_code == 200
+    payload_no_type = response_no_type.json()
+    key_no_type = payload_no_type["source"]["key"]
+    assert key_no_type.endswith("/input/spaces.jsonl")
+    assert payload_no_type["source"]["filename"] == "spaces.jsonl"
+
+    presign_second = s3.presigned[-1]
+    assert presign_second["Params"]["Key"] == key_no_type
+    assert "ContentType" not in presign_second["Params"]
+
+    # Ensure job metadata stored the sanitized filename
+    record = table._items[(f"job#{payload_no_type['jobId']}", "meta")]
+    assert record["source"]["filename"] == "spaces.jsonl"
 
 
 def test_create_job_handles_state_machine_failure(api_app):

@@ -120,10 +120,23 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 // ---- API calls ----
-export async function createUploadJob(): Promise<CreateJobResponse> {
+export async function createUploadJob(file: File | Blob): Promise<CreateJobResponse> {
+  const sourceConfig: Record<string, unknown> = {};
+  if (file instanceof File && file.name) {
+    sourceConfig.filename = file.name;
+  }
+  if (typeof file.type === "string" && file.type.trim() !== "") {
+    sourceConfig.contentType = file.type;
+  }
+
+  const payload: Record<string, unknown> = { source_type: "upload" };
+  if (Object.keys(sourceConfig).length > 0) {
+    payload.source_config = sourceConfig;
+  }
+
   return apiFetch<CreateJobResponse>("jobs", {
     method: "POST",
-    body: JSON.stringify({ source_type: "upload" }),
+    body: JSON.stringify(payload),
   });
 }
 
@@ -175,7 +188,11 @@ export async function processJobNow(jobId: string): Promise<{ ok: boolean; resul
 }
 
 export async function uploadToPresigned(url: string, file: File | Blob): Promise<void> {
-  const r = await fetch(url, { method: "PUT", headers: { "content-type": "text/csv" }, body: file });
+  const headers: Record<string, string> = {};
+  if (typeof file.type === "string" && file.type.trim() !== "") {
+    headers["content-type"] = file.type;
+  }
+  const r = await fetch(url, { method: "PUT", headers, body: file });
   if (!r.ok) throw new Error(`Upload failed: ${r.status} ${r.statusText}`);
 }
 
