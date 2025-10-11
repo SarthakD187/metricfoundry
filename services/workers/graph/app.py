@@ -7,12 +7,15 @@ from typing import Any, Dict, Mapping, Optional, Callable
 from collections.abc import Mapping as MappingABC
 
 from langgraph.graph import END, StateGraph
-from langgraph.checkpoint.sqlite import SqliteSaver
 try:
-    from langgraph.checkpoint.dynamodb import DynamoDBSaver
+    from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore
 except Exception:
-    DynamoDBSaver = None  # type: ignore
+    SqliteSaver = None  # type: ignore
 
+try:
+    from langgraph.checkpoint.dynamodb import DynamoDBSaver  # type: ignore
+except Exception:
+    DynamoDBSaver = None
 from .nodes import (
     ingest_node, profile_node, dq_validate_node, descriptive_stats_node,
     ml_inference_node, nl_report_node, finalize_node
