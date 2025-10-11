@@ -29,7 +29,7 @@ def ensure_langgraph_stub() -> None:
             self._nodes = nodes
             self._order = order
 
-        def invoke(self, initial_state):
+        def invoke(self, initial_state, config=None):  # pragma: no cover - config ignored in stub
             state = dict(initial_state)
             for name in self._order:
                 update = self._nodes[name](state)
@@ -52,7 +52,7 @@ def ensure_langgraph_stub() -> None:
         def add_edge(self, source, dest):
             self._edges.setdefault(source, []).append(dest)
 
-        def compile(self):
+        def compile(self, checkpointer=None):  # pragma: no cover - checkpointer ignored in stub
             order: List[str] = []
             current = self._entry
             visited: set[str] = set()

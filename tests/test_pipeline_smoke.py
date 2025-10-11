@@ -80,10 +80,10 @@ def test_pipeline_no_checkpoint(env_guard, tmp_path):
     os.environ["MF_DISABLE_CHECKPOINT"] = "1"
 
     res = run_pipeline(
-        job_id="pytest-smoke-no-ckpt",
-        source={"key": "iris.csv"},
-        body=io.BytesIO(CSV_SMALL),
-        artifact_prefix=f"artifacts/pytest-no-ckpt",
+        "pytest-smoke-no-ckpt",
+        {"key": "iris.csv"},
+        f"artifacts/pytest-no-ckpt",
+        io.BytesIO(CSV_SMALL),
     )
 
     _assert_pipeline_result(res)
@@ -101,10 +101,10 @@ def test_pipeline_with_checkpoint(env_guard, tmp_path):
     os.environ["CHECKPOINT_SQLITE_PATH"] = str(ckpt_path)
 
     res = run_pipeline(
-        job_id="pytest-smoke-ckpt",
-        source={"key": "iris.csv"},
-        body=io.BytesIO(CSV_SMALL),
-        artifact_prefix=f"artifacts/pytest-ckpt",
+        "pytest-smoke-ckpt",
+        {"key": "iris.csv"},
+        f"artifacts/pytest-ckpt",
+        io.BytesIO(CSV_SMALL),
     )
 
     _assert_pipeline_result(res)

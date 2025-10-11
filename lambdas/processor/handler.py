@@ -1,30 +1,44 @@
-import csv
-import io
+import base64
 import json
 import os
 import time
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import boto3
-from botocore.exceptions import ClientError
 
-from services.workers.graph.graph import PHASE_ORDER, PipelineResult, run_pipeline
+from services.common.pipeline import (
+    build_results_payload,
+    emit_parse_debug,
+    object_exists,
+    persist_pipeline_outputs,
+    error_key_for,
+    result_key_for,
+    summarize_phase_payload,
+)
+from services.workers.graph.graph import (
+    PHASE_ORDER,
+    PipelineResult,
+    decode_pipeline_result,
+    run_pipeline,
+)
 
 s3 = boto3.client("s3")
 ddb = boto3.resource("dynamodb")
+lambda_client = boto3.client("lambda")
 
 TABLE_NAME = os.environ["JOBS_TABLE"]
 ARTIFACTS_BUCKET = os.environ.get("ARTIFACTS_BUCKET")
-
-ANALYSIS_VERSION = "TEST-2025-10-09"
-
+WORKER_INVOKE_MODE = os.environ.get("WORKER_INVOKE_MODE", "embedded").strip().lower()
+WORKER_ARN = os.environ.get("WORKER_ARN")
+WORKER_URL = os.environ.get("WORKER_URL")
+WORKER_AUTH_HEADER = os.environ.get("WORKER_AUTH_HEADER")
+WORKER_BEARER_TOKEN = os.environ.get("WORKER_BEARER_TOKEN")
 
 STATUS_RUNNING = "RUNNING"
 STATUS_SUCCEEDED = "SUCCEEDED"
 STATUS_FAILED = "FAILED"
-
-ANALYSIS_VERSION = "2024.05"
 
 
 def ddb_table():
@@ -53,101 +67,6 @@ def ddb_upsert_status(job_id: str, status: str, **attrs) -> None:
     )
 
 
-def result_key_for(job_id: str) -> str:
-    return f"artifacts/{job_id}/results/results.json"
-
-
-def manifest_key_for(job_id: str) -> str:
-    return f"artifacts/{job_id}/results/manifest.json"
-
-
-def phase_key_for(job_id: str, phase: str) -> str:
-    return f"artifacts/{job_id}/phases/{phase}.json"
-
-
-def artifact_key_for(job_id: str, relative: str) -> str:
-    return f"artifacts/{job_id}/{relative}"
-
-
-def object_exists(bucket: str, key: str) -> bool:
-    try:
-        s3.head_object(Bucket=bucket, Key=key)
-        return True
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code")
-        if code in ("404", "NotFound", "NoSuchKey"):
-            return False
-        raise
-
-
-def _json_bytes(data: Any) -> bytes:
-    return json.dumps(data, indent=2, default=str).encode("utf-8")
-
-
-def _csv_bytes(headers: list[str], rows: list[Mapping[str, Any]]) -> bytes:
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=headers)
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({h: row.get(h, "") for h in headers})
-    return output.getvalue().encode("utf-8")
-
-
-def _put_object(bucket: str, key: str, body: bytes, content_type: str) -> None:
-    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType=content_type)
-
-
-def _persist_artifact(bucket: str, key: str, spec: Mapping[str, Any]) -> None:
-    kind = spec.get("kind")
-    content_type = spec.get("contentType", "application/octet-stream")
-    if kind == "json":
-        body = _json_bytes(spec.get("data"))
-    elif kind == "text":
-        text = spec.get("text", "")
-        body = text.encode("utf-8")
-    elif kind == "csv":
-        headers = spec.get("headers", [])
-        rows = spec.get("rows", [])
-        body = _csv_bytes(list(headers), list(rows))
-    elif kind == "html":
-        html = spec.get("html", "")
-        if isinstance(html, bytes):
-            body = html
-        else:
-            body = str(html).encode("utf-8")
-    elif kind == "image":
-        data = spec.get("data", b"")
-        if isinstance(data, memoryview):  # pragma: no cover - defensive conversion
-            data = data.tobytes()
-        if not isinstance(data, (bytes, bytearray)):
-            raise ValueError("Image artifact data must be bytes-like")
-        body = bytes(data)
-    elif kind == "binary":
-        data = spec.get("data", b"")
-        if isinstance(data, memoryview):
-            data = data.tobytes()
-        if not isinstance(data, (bytes, bytearray)):
-            raise ValueError("Binary artifact data must be bytes-like")
-        body = bytes(data)
-    else:
-        raise ValueError(f"Unsupported artifact kind: {kind}")
-    _put_object(bucket, key, body, content_type)
-
-
-def _summarize_phase_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
-    summary: Dict[str, Any] = {}
-    if "summary" in payload and isinstance(payload["summary"], str):
-        summary["summary"] = payload["summary"]
-    if "metrics" in payload and isinstance(payload["metrics"], Mapping):
-        summary["metrics"] = payload["metrics"]
-    if "datasetCompleteness" in payload:
-        summary["datasetCompleteness"] = payload["datasetCompleteness"]
-    if not summary:
-        keys = list(payload.keys())[:5]
-        summary["fields"] = keys
-    return summary
-
-
 def _default_callback(job_id: str):
     def _callback(phase: str, payload: Mapping[str, Any], index: int, total: int) -> None:
         progress = int(((index + 1) / total) * 100)
@@ -159,7 +78,7 @@ def _default_callback(job_id: str):
                 phaseIndex=index,
                 phaseCount=total,
                 progress=progress,
-                phaseSummary=_summarize_phase_payload(payload),
+                phaseSummary=summarize_phase_payload(payload),
             )
         except Exception as exc:  # pragma: no cover - DynamoDB errors shouldn't halt job
             print(f"[ProcessorFn] Warning: failed to stream phase status for {phase}: {exc}")
@@ -167,168 +86,231 @@ def _default_callback(job_id: str):
     return _callback
 
 
-def _persist_pipeline_outputs(job_id: str, bucket: str, result: PipelineResult) -> Dict[str, str]:
-    phase_keys: Dict[str, str] = {}
-    for phase, payload in result.phases.items():
-        key = phase_key_for(job_id, phase)
-        _put_object(bucket, key, _json_bytes(payload), "application/json")
-        phase_keys[phase] = key
-
-    for relative, spec in result.artifact_contents.items():
-        key = artifact_key_for(job_id, relative)
-        _persist_artifact(bucket, key, spec)
-
-    manifest_key = manifest_key_for(job_id)
-    _put_object(bucket, manifest_key, _json_bytes(result.manifest), "application/json")
-
-    return {"manifest": manifest_key, **{f"phase:{k}": v for k, v in phase_keys.items()}}
+def _is_embedded_mode() -> bool:
+    return WORKER_INVOKE_MODE in {"", "embedded", "local"}
 
 
-def _build_schema_from_profile(profile_phase: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    schema: List[Dict[str, Any]] = []
-    columns = profile_phase.get("columnProfiles")
-    if not isinstance(columns, list):
-        return schema
-    for item in columns:
-        if not isinstance(item, Mapping):
-            continue
-        name = item.get("name")
-        if name is None:
-            continue
-        entry: Dict[str, Any] = {"name": str(name)}
-        inferred = item.get("inferredType")
-        if inferred is not None:
-            entry["type"] = inferred
-        schema.append(entry)
-    return schema
-
-
-def _emit_parse_debug(job_id: str, bucket: str, profile_phase: Mapping[str, Any]) -> Optional[str]:
-    """
-    Write a tiny debug artifact so we can see what the parser actually produced.
-    Looks for common keys emitted by a profiler node.
-    """
-    try:
-        debug: Dict[str, Any] = {}
-        # shape / dtypes
-        shape = profile_phase.get("shape")
-        if isinstance(shape, Mapping):
-            debug["shape"] = {k: int(v) for k, v in shape.items() if isinstance(v, int)}
-        dtypes = profile_phase.get("dtypes")
-        if isinstance(dtypes, Mapping):
-            debug["dtypes"] = {str(k): str(v) for k, v in dtypes.items()}
-        # head preview
-        head = profile_phase.get("head")
-        if isinstance(head, list):
-            debug["head"] = head[:3]
-        # fallback: column names
-        cols = profile_phase.get("columnProfiles")
-        if isinstance(cols, list):
-            debug["columnNames"] = [
-                str(c.get("name")) for c in cols if isinstance(c, Mapping) and c.get("name")
-            ][:50]
-        key = artifact_key_for(job_id, "results/parse_debug.json")
-        _put_object(bucket, key, _json_bytes(debug), "application/json")
-        return key
-    except Exception:
+def _worker_callback_payload(job_id: str) -> Optional[Dict[str, Any]]:
+    if _is_embedded_mode():
         return None
 
+    table_name = os.environ.get("TABLE_NAME") or TABLE_NAME
+    if table_name:
+        return {"mode": "ddb", "table": table_name, "jobId": job_id}
+    return {"mode": "log", "jobId": job_id}
 
-def build_results_payload(
+
+def _ensure_bytes(data: Any) -> bytes:
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return bytes(data)
+
+    reader = getattr(data, "read", None)
+    if callable(reader):
+        chunks = bytearray()
+        chunk_size = 8 * 1024 * 1024
+        while True:
+            try:
+                piece = reader(chunk_size)
+            except TypeError:
+                piece = reader()
+            if not piece:
+                break
+            if isinstance(piece, memoryview):
+                piece = piece.tobytes()
+            elif isinstance(piece, bytearray):
+                piece = bytes(piece)
+            if not isinstance(piece, (bytes, bytearray)):
+                raise TypeError("Stream produced non-bytes payload")
+            chunks.extend(piece)
+        return bytes(chunks)
+
+    raise TypeError(f"Unsupported body type: {type(data).__name__}")
+
+
+def _build_worker_event(
     job_id: str,
-    result: PipelineResult,
+    source: Mapping[str, Any],
+    artifact_prefix: str,
     *,
-    source_input: Optional[Mapping[str, Any]] = None,
-    artifact_bucket: Optional[str] = None,
+    body_bytes: Optional[bytes] = None,
+    body_s3: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
-    metrics = dict(result.metrics)
-    profile_phase = result.phases.get("profile", {}) or {}
-
-    # Build schema BEFORE summary so we can use it for robust fallbacks
-    schema = _build_schema_from_profile(profile_phase)
-
-    # Best-effort fallbacks for rows/columns (avoid numeric-only mistakes)
-    def _rows_fallback() -> Optional[int]:
-        # common shapes produced by profilers
-        for k in ("rowCount", "rows", "nRows", "shapeRows"):
-            v = profile_phase.get(k)
-            if isinstance(v, int) and v >= 0:
-                return v
-        # sometimes embedded under "shape" or "metrics"
-        shp = profile_phase.get("shape")
-        if isinstance(shp, Mapping) and isinstance(shp.get("rows"), int):
-            return shp["rows"]
-        m = profile_phase.get("metrics")
-        if isinstance(m, Mapping) and isinstance(m.get("rows"), int):
-            return m["rows"]
-        return None
-
-    def _cols_fallback() -> Optional[int]:
-        # most reliable: the length of the built schema
-        if schema:
-            return len(schema)
-        for k in ("columnCount", "columns", "nCols", "shapeCols"):
-            v = profile_phase.get(k)
-            if isinstance(v, int) and v >= 0:
-                return v
-        shp = profile_phase.get("shape")
-        if isinstance(shp, Mapping) and isinstance(shp.get("columns"), int):
-            return shp["columns"]
-        cols = profile_phase.get("columnProfiles")
-        if isinstance(cols, list):
-            return len(cols)
-        return None
-
-    rows_val = metrics.get("rows")
-    cols_val = metrics.get("columns")
-    if not isinstance(rows_val, int):
-        fb = _rows_fallback()
-        if isinstance(fb, int):
-            rows_val = fb
-    if not isinstance(cols_val, int):
-        fb = _cols_fallback()
-        if isinstance(fb, int):
-            cols_val = fb
-
-    summary = {
-        "rows": rows_val,
-        "columns": cols_val,
-        "bytesRead": metrics.get("bytesRead"),
-        "datasetCompleteness": metrics.get("datasetCompleteness"),
-        "dqScore": metrics.get("dqScore"),
-    }
-    summary = {key: value for key, value in summary.items() if value is not None}
-
-    links: Dict[str, str] = {}
-    if source_input:
-        src_bucket = source_input.get("bucket")
-        src_key = source_input.get("key")
-        if src_bucket and src_key:
-            links["input"] = f"s3://{src_bucket}/{src_key}"
-
-    if artifact_bucket:
-        manifest_uri = f"s3://{artifact_bucket}/{manifest_key_for(job_id)}"
-        results_uri = f"s3://{artifact_bucket}/{result_key_for(job_id)}"
-        links["resultsManifest"] = manifest_uri
-        links["resultsJson"] = results_uri
-
-    payload = {
+    payload: Dict[str, Any] = {
         "jobId": job_id,
-        "analysisVersion": ANALYSIS_VERSION,
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "summary": summary,
-        "schema": schema,
-        "links": links,
-        "phases": result.phases,
-        "metrics": metrics,
-        "correlations": result.correlations,
-        "outliers": result.outliers,
-        "mlInference": result.ml_inference,
-        "artifactManifest": result.manifest,
-        "phaseArtifactKeys": {phase: phase_key_for(job_id, phase) for phase in result.phases},
+        "source": dict(source),
+        "artifactPrefix": artifact_prefix,
     }
-
+    if body_bytes is not None:
+        payload["body"] = base64.b64encode(body_bytes).decode("ascii")
+    if body_s3:
+        payload["bodyS3"] = dict(body_s3)
+    callback_cfg = _worker_callback_payload(job_id)
+    if callback_cfg:
+        payload["callback"] = callback_cfg
     return payload
+
+
+def _invoke_worker_lambda(
+    job_id: str,
+    source: Mapping[str, Any],
+    artifact_prefix: str,
+    *,
+    body_bytes: Optional[bytes] = None,
+    body_s3: Optional[Mapping[str, str]] = None,
+) -> PipelineResult:
+    if not WORKER_ARN:
+        raise RuntimeError("WORKER_ARN must be configured for lambda mode")
+
+    if body_bytes is None and body_s3 is None:
+        raise ValueError("Worker invocation requires body_bytes or body_s3")
+
+    event = _build_worker_event(
+        job_id,
+        source,
+        artifact_prefix,
+        body_bytes=body_bytes,
+        body_s3=body_s3,
+    )
+    print(f"[ProcessorFn] Invoking LangGraph worker Lambda for job {job_id}")
+    response = lambda_client.invoke(
+        FunctionName=WORKER_ARN,
+        InvocationType="RequestResponse",
+        Payload=json.dumps(event).encode("utf-8"),
+    )
+
+    payload_stream = response.get("Payload")
+    if payload_stream is None:
+        raise RuntimeError("Worker Lambda response missing payload stream")
+
+    try:
+        raw = payload_stream.read()
+    finally:
+        closer = getattr(payload_stream, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:
+                pass
+
+    if "FunctionError" in response:
+        message = raw.decode("utf-8", errors="ignore") if raw else "(no error payload)"
+        raise RuntimeError(f"Worker Lambda execution failed: {message}")
+
+    if not raw:
+        raise RuntimeError("Worker Lambda returned empty payload")
+
+    try:
+        decoded = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+        raise RuntimeError("Worker Lambda returned invalid JSON") from exc
+
+    return decode_pipeline_result(decoded)
+
+
+def _invoke_worker_http(
+    job_id: str,
+    source: Mapping[str, Any],
+    artifact_prefix: str,
+    *,
+    body_bytes: Optional[bytes] = None,
+    body_s3: Optional[Mapping[str, str]] = None,
+) -> PipelineResult:
+    if not WORKER_URL:
+        raise RuntimeError("WORKER_URL must be configured for http mode")
+
+    if body_bytes is None and body_s3 is None:
+        raise ValueError("Worker invocation requires body_bytes or body_s3")
+
+    event = _build_worker_event(
+        job_id,
+        source,
+        artifact_prefix,
+        body_bytes=body_bytes,
+        body_s3=body_s3,
+    )
+    data = json.dumps(event).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if WORKER_BEARER_TOKEN:
+        headers["Authorization"] = f"Bearer {WORKER_BEARER_TOKEN.strip()}"
+    elif WORKER_AUTH_HEADER:
+        try:
+            name, value = WORKER_AUTH_HEADER.split(":", 1)
+        except ValueError as exc:
+            raise RuntimeError(
+                "WORKER_AUTH_HEADER must be in the format 'Header-Name: value'"
+            ) from exc
+        headers[name.strip()] = value.strip()
+
+    request = urllib_request.Request(
+        WORKER_URL,
+        data=data,
+        headers=headers,
+        method="POST",
+    )
+    print(f"[ProcessorFn] Invoking LangGraph worker HTTP endpoint for job {job_id}")
+    try:
+        with urllib_request.urlopen(request, timeout=900) as response:
+            raw = response.read()
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
+        raise RuntimeError(f"Worker HTTP error {exc.code}: {detail}") from exc
+    except urllib_error.URLError as exc:  # pragma: no cover - defensive
+        raise RuntimeError(f"Worker HTTP invocation failed: {exc}") from exc
+
+    if not raw:
+        raise RuntimeError("Worker HTTP endpoint returned empty payload")
+
+    try:
+        decoded = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+        raise RuntimeError("Worker HTTP endpoint returned invalid JSON") from exc
+
+    return decode_pipeline_result(decoded)
+
+
+def _invoke_pipeline(
+    job_id: str,
+    source: Mapping[str, Any],
+    artifact_prefix: str,
+    body: Any,
+    *,
+    body_s3: Optional[Mapping[str, str]] = None,
+    on_phase,
+) -> PipelineResult:
+    mode = WORKER_INVOKE_MODE or "embedded"
+    if mode in {"embedded", "", "local"}:
+        if body is None:
+            raise ValueError("Embedded mode requires a body stream or bytes")
+        return run_pipeline(job_id, source, artifact_prefix, body, on_phase=on_phase)
+
+    body_bytes = _ensure_bytes(body) if body is not None else None
+    if mode == "lambda":
+        return _invoke_worker_lambda(
+            job_id,
+            source,
+            artifact_prefix,
+            body_bytes=body_bytes,
+            body_s3=body_s3,
+        )
+    if mode == "http":
+        return _invoke_worker_http(
+            job_id,
+            source,
+            artifact_prefix,
+            body_bytes=body_bytes,
+            body_s3=body_s3,
+        )
+    raise ValueError(f"Unsupported WORKER_INVOKE_MODE: {mode}")
+
+
+def _log_phase_progress(job_id: str, phases: Mapping[str, Any]) -> None:
+    ordered = [phase for phase in PHASE_ORDER if phase in phases]
+    total = len(ordered) or len(PHASE_ORDER)
+    for index, phase in enumerate(ordered):
+        print(
+            f"[ProcessorFn] Phase {phase} completed for job {job_id} "
+            f"({index + 1}/{total})"
+        )
 
 
 def main(event, _ctx):
@@ -351,7 +333,7 @@ def main(event, _ctx):
     results_key = result_key_for(job_id)
 
     try:
-        if ARTIFACTS_BUCKET and object_exists(ARTIFACTS_BUCKET, results_key):
+        if ARTIFACTS_BUCKET and object_exists(s3, ARTIFACTS_BUCKET, results_key):
             print(
                 f"[ProcessorFn] Results already exist at s3://{ARTIFACTS_BUCKET}/{results_key} (idempotent skip)."
             )
@@ -360,41 +342,70 @@ def main(event, _ctx):
         print(f"[ProcessorFn] Warning: head_object failed for existing results check: {e}")
 
     try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        body = obj["Body"]
+        source_descriptor = {"bucket": bucket, "key": key}
+        body_stream: Optional[Any] = None
+        body_s3_descriptor: Optional[Dict[str, str]] = {"bucket": bucket, "key": key}
+        callback = None
+
+        if _is_embedded_mode():
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            body_stream = obj["Body"]
+            callback = _default_callback(job_id)
+            body_s3_descriptor = None
+
         try:
-            result = run_pipeline(
+            result = _invoke_pipeline(
                 job_id,
-                {"bucket": bucket, "key": key},
-                body,
-                artifact_prefix=artifact_prefix,
-                on_phase=_default_callback(job_id),
+                source_descriptor,
+                artifact_prefix,
+                body_stream,
+                body_s3=body_s3_descriptor,
+                on_phase=callback,
             )
         finally:
-            closer = getattr(body, "close", None)
-            if callable(closer):
-                try:
-                    closer()
-                except Exception:
-                    pass
+            if body_stream is not None:
+                closer = getattr(body_stream, "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except Exception:
+                        pass
+
+        if not _is_embedded_mode():
+            _log_phase_progress(job_id, result.phases)
 
         target_bucket = ARTIFACTS_BUCKET or bucket
-        artifact_keys = _persist_pipeline_outputs(job_id, target_bucket, result)
+        artifact_keys = persist_pipeline_outputs(
+            job_id,
+            target_bucket,
+            result,
+            s3_client=s3,
+        )
 
         results_payload = build_results_payload(
             job_id,
             result,
-            source_input=payload_input,
+            source_input=source_descriptor,
             artifact_bucket=target_bucket,
         )
 
         # Best-effort parse debug to aid troubleshooting
         try:
-            _emit_parse_debug(job_id, target_bucket, result.phases.get("profile", {}) or {})
+            emit_parse_debug(
+                job_id,
+                target_bucket,
+                result.phases.get("profile", {}) or {},
+                s3_client=s3,
+            )
         except Exception:
             pass
 
-        _put_object(target_bucket, results_key, _json_bytes(results_payload), "application/json")
+        s3.put_object(
+            Bucket=target_bucket,
+            Key=results_key,
+            Body=json.dumps(results_payload, indent=2, default=str).encode("utf-8"),
+            ContentType="application/json",
+        )
 
         try:
             ddb_upsert_status(
@@ -421,12 +432,12 @@ def main(event, _ctx):
 
         try:
             target_bucket = ARTIFACTS_BUCKET or bucket
-            error_key = results_key.replace("results.json", "error.json")
-            _put_object(
-                target_bucket,
-                error_key,
-                _json_bytes({"jobId": job_id, "error": err_txt}),
-                "application/json",
+            error_key = error_key_for(job_id)
+            s3.put_object(
+                Bucket=target_bucket,
+                Key=error_key,
+                Body=json.dumps({"jobId": job_id, "error": err_txt}, indent=2).encode("utf-8"),
+                ContentType="application/json",
             )
         except Exception as e3:
             print(f"[ProcessorFn] Warning: failed to write error artifact: {e3}")
