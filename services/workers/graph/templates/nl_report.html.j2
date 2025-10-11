@@ -245,10 +245,10 @@
               </tr>
             </thead>
             <tbody>
-              {% for value in outlier.values %}
+              {% for point in outlier["values"] %}
                 <tr>
-                  <td>{{ value.value }}</td>
-                  <td>{{ value.zscore | round(2) }}</td>
+                  <td>{{ point.value }}</td>
+                  <td>{{ point.zscore | round(2) }}</td>
                 </tr>
               {% endfor %}
             </tbody>

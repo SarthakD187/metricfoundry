@@ -43,3 +43,8 @@ graph.ckpt.sqlite
 services/api/PY
 services/api/import
 services/api/pk
+artifacts/
+*.sqlite
+.graph*
+__pycache__/
+*.pyc
