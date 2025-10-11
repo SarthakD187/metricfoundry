@@ -213,7 +213,7 @@ def api_app(monkeypatch):
     graph_module = importlib.import_module("services.workers.graph.graph")
     stub_phase_order = ["ingest", "profile", "descriptive_stats", "nl_report", "finalize"]
 
-    def _stub_run_pipeline(job_id, source, body, *, artifact_prefix, on_phase=None):
+    def _stub_run_pipeline(job_id, source, artifact_prefix, body, *, on_phase=None):
         phases = {
             "ingest": {"summary": "ingested", "rows": 2, "sourceFormat": "csv"},
             "profile": {"columnProfiles": [{"name": "value", "inferredType": "integer"}]},

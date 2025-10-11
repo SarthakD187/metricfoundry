@@ -7,6 +7,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, TYPE_CHECKING
 
+from botocore.exceptions import ClientError
+
 if TYPE_CHECKING:  # pragma: no cover - import only for static typing
     from services.workers.graph.graph import PipelineResult
 else:  # pragma: no cover - at runtime we treat PipelineResult as ``Any``
@@ -26,6 +28,10 @@ def manifest_key_for(job_id: str) -> str:
 
 def phase_key_for(job_id: str, phase: str) -> str:
     return f"artifacts/{job_id}/phases/{phase}.json"
+
+
+def error_key_for(job_id: str) -> str:
+    return f"artifacts/{job_id}/results/error.json"
 
 
 def artifact_key_for(job_id: str, relative: str) -> str:
@@ -164,6 +170,36 @@ def summarize_phase_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return {"fields": keys}
 
 
+def _profile_rows_fallback(profile_phase: Mapping[str, Any], schema: List[Dict[str, Any]]) -> Optional[int]:
+    for key in ("rowCount", "rows", "nRows", "shapeRows"):
+        value = profile_phase.get(key)
+        if isinstance(value, int) and value >= 0:
+            return value
+    shape = profile_phase.get("shape")
+    if isinstance(shape, Mapping) and isinstance(shape.get("rows"), int):
+        return shape["rows"]
+    metrics = profile_phase.get("metrics")
+    if isinstance(metrics, Mapping) and isinstance(metrics.get("rows"), int):
+        return metrics["rows"]
+    return None
+
+
+def _profile_columns_fallback(profile_phase: Mapping[str, Any], schema: List[Dict[str, Any]]) -> Optional[int]:
+    if schema:
+        return len(schema)
+    for key in ("columnCount", "columns", "nCols", "shapeCols"):
+        value = profile_phase.get(key)
+        if isinstance(value, int) and value >= 0:
+            return value
+    shape = profile_phase.get("shape")
+    if isinstance(shape, Mapping) and isinstance(shape.get("columns"), int):
+        return shape["columns"]
+    columns = profile_phase.get("columnProfiles")
+    if isinstance(columns, list):
+        return len(columns)
+    return None
+
+
 def build_results_payload(
     job_id: str,
     result: "PipelineResult",
@@ -173,9 +209,43 @@ def build_results_payload(
     analysis_version: str = ANALYSIS_VERSION,
 ) -> Dict[str, Any]:
     metrics = dict(result.metrics)
+    profile_phase = (
+        result.phases.get("profile")
+        if isinstance(result.phases, Mapping)
+        else None
+    ) or {}
+
+    schema: List[Dict[str, Any]] = []
+    if isinstance(profile_phase, Mapping):
+        columns = profile_phase.get("columnProfiles")
+        if isinstance(columns, list):
+            for column in columns:
+                if not isinstance(column, Mapping):
+                    continue
+                name = column.get("name")
+                if name is None:
+                    continue
+                entry: Dict[str, Any] = {"name": str(name)}
+                inferred = column.get("inferredType")
+                if inferred is not None:
+                    entry["type"] = inferred
+                schema.append(entry)
+
+    rows_value = metrics.get("rows")
+    if not isinstance(rows_value, int):
+        fallback_rows = _profile_rows_fallback(profile_phase, schema)
+        if isinstance(fallback_rows, int):
+            rows_value = fallback_rows
+
+    columns_value = metrics.get("columns")
+    if not isinstance(columns_value, int):
+        fallback_cols = _profile_columns_fallback(profile_phase, schema)
+        if isinstance(fallback_cols, int):
+            columns_value = fallback_cols
+
     summary = {
-        "rows": metrics.get("rows"),
-        "columns": metrics.get("columns"),
+        "rows": rows_value,
+        "columns": columns_value,
         "bytesRead": metrics.get("bytesRead"),
         "datasetCompleteness": metrics.get("datasetCompleteness"),
         "dqScore": metrics.get("dqScore"),
@@ -192,23 +262,6 @@ def build_results_payload(
     if artifact_bucket:
         links["resultsManifest"] = f"s3://{artifact_bucket}/{manifest_key_for(job_id)}"
         links["resultsJson"] = f"s3://{artifact_bucket}/{result_key_for(job_id)}"
-
-    profile_phase = result.phases.get("profile", {})
-    schema: List[Dict[str, Any]] = []
-    if isinstance(profile_phase, Mapping):
-        columns = profile_phase.get("columnProfiles")
-        if isinstance(columns, list):
-            for column in columns:
-                if not isinstance(column, Mapping):
-                    continue
-                name = column.get("name")
-                if name is None:
-                    continue
-                entry: Dict[str, Any] = {"name": str(name)}
-                inferred = column.get("inferredType")
-                if inferred is not None:
-                    entry["type"] = inferred
-                schema.append(entry)
 
     payload = {
         "jobId": job_id,
@@ -229,11 +282,67 @@ def build_results_payload(
     return payload
 
 
+def emit_parse_debug(
+    job_id: str,
+    bucket: str,
+    profile_phase: Mapping[str, Any],
+    *,
+    s3_client,
+) -> Optional[str]:
+    try:
+        debug: Dict[str, Any] = {}
+        shape = profile_phase.get("shape")
+        if isinstance(shape, Mapping):
+            debug["shape"] = {
+                key: int(value)
+                for key, value in shape.items()
+                if isinstance(value, int)
+            }
+        dtypes = profile_phase.get("dtypes")
+        if isinstance(dtypes, Mapping):
+            debug["dtypes"] = {str(key): str(value) for key, value in dtypes.items()}
+        head = profile_phase.get("head")
+        if isinstance(head, list):
+            debug["head"] = head[:3]
+        columns = profile_phase.get("columnProfiles")
+        if isinstance(columns, list):
+            debug["columnNames"] = [
+                str(column.get("name"))
+                for column in columns
+                if isinstance(column, Mapping) and column.get("name")
+            ][:50]
+
+        key = artifact_key_for(job_id, "results/parse_debug.json")
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=_json_bytes(debug),
+            ContentType="application/json",
+        )
+        return key
+    except Exception:
+        return None
+
+
+def object_exists(s3_client, bucket: str, key: str) -> bool:
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in {"404", "NotFound", "NoSuchKey"}:
+            return False
+        raise
+
+
 __all__ = [
     "ANALYSIS_VERSION",
     "artifact_key_for",
     "build_results_payload",
+    "emit_parse_debug",
+    "error_key_for",
     "manifest_key_for",
+    "object_exists",
     "persist_pipeline_outputs",
     "phase_key_for",
     "result_key_for",

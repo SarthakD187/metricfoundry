@@ -48,6 +48,12 @@ large files may still exceed the Lambda's available memory or timeout budget,
 but those cases surface explicit failure events and error artifacts so you can
 iterate safely.
 
+Remote deployments can further constrain ingestion footprint via the
+`MAX_PIPELINE_BODY_BYTES` environment variable (default 512 MiB). The LangGraph
+worker enforces this limit before materialising staged S3 bodies, preventing
+out-of-memory crashes while giving operators a tunable ceiling that matches their
+runtime budgets.
+
 ## API hardening & observability
 
 The FastAPI service fronts the ingestion workflow and exposes endpoints for

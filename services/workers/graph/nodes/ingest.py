@@ -1,7 +1,9 @@
 from __future__ import annotations
-from typing import Any, Dict, MutableMapping, Optional, Union, IO
+from typing import Any, Dict, MutableMapping, Optional
+
 from ..core.state import _with_phase, _emit_callback
 from ..io.ingest import ingest_dataset
+from ..core.types import BinaryInput
 
 def ingest_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
     source = state.get("source", {}) or {}
@@ -11,18 +13,21 @@ def ingest_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
     if body_input is None:
         body_input = state.get("body")
 
+    dataset_input: BinaryInput
     if body_input is None:
-        data_bytes = b""
-    elif isinstance(body_input, (bytes, bytearray)):
-        data_bytes = bytes(body_input)
+        dataset_input = b""
     else:
-        try:
-            body_input.seek(0)
-        except Exception:
-            pass
-        data_bytes = body_input.read()
+        if isinstance(body_input, bytearray):
+            dataset_input = bytes(body_input)
+        else:
+            if hasattr(body_input, "seek"):
+                try:
+                    body_input.seek(0)
+                except Exception:
+                    pass
+            dataset_input = body_input
 
-    dataset = ingest_dataset(key, data_bytes)
+    dataset = ingest_dataset(key, dataset_input)
 
     closer = getattr(body_input, "close", None)
     if callable(closer):

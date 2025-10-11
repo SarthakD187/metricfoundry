@@ -95,7 +95,11 @@ class _ChunkedBinaryStream:
         return True
 
 
-ensure_langgraph_stub()
+def _ensure_state_graph_stub() -> None:
+    ensure_langgraph_stub()
+
+
+_ensure_state_graph_stub()
 module = importlib.import_module("services.workers.graph.graph")
 importlib.reload(module)
 run_pipeline = module.run_pipeline
@@ -113,7 +117,7 @@ PHASE_ORDER = module.PHASE_ORDER
 )
 def test_pipeline_ingests_diverse_formats(key, body, expected_format):
     job_id = f"job-{expected_format}"
-    result = run_pipeline(job_id, {"key": key}, body, artifact_prefix=f"artifacts/{job_id}")
+    result = run_pipeline(job_id, {"key": key}, f"artifacts/{job_id}", body)
 
     for phase in PHASE_ORDER:
         assert phase in result.phases
@@ -134,6 +138,18 @@ def test_pipeline_ingests_diverse_formats(key, body, expected_format):
     assert f"artifacts/{job_id}/results/bundles/analytics_bundle.zip" in manifest_keys
     assert f"artifacts/{job_id}/phases/phase_payloads.zip" in manifest_keys
     assert f"artifacts/{job_id}/results/report.html" in manifest_keys
+
+
+def test_pipeline_accepts_streaming_body():
+    job_id = "job-streaming"
+    stream = _ChunkedBinaryStream(_csv_bytes(SAMPLE_ROWS), chunk_size=1024)
+    result = run_pipeline(job_id, {"key": "sample.csv"}, f"artifacts/{job_id}", stream)
+
+    ingest = result.phases["ingest"]
+    assert ingest["rows"] == len(SAMPLE_ROWS)
+    assert ingest["sourceFormat"] == "csv"
+    manifest_keys = {entry["key"] for entry in result.manifest.get("artifacts", [])}
+    assert f"artifacts/{job_id}/results/results.json" in manifest_keys
     assert any(key.startswith(f"artifacts/{job_id}/results/graphs/") for key in manifest_keys)
 
     contents_keys = result.artifact_contents.keys()
@@ -172,7 +188,12 @@ def test_pipeline_streams_delimited_input_without_full_decode():
     stream = _ChunkedBinaryStream(payload, chunk_size=7)
     job_id = "job-streaming"
 
-    result = run_pipeline(job_id, {"key": "stream.csv"}, stream, artifact_prefix=f"artifacts/{job_id}")
+    result = run_pipeline(
+        job_id,
+        {"key": "stream.csv"},
+        f"artifacts/{job_id}",
+        stream,
+    )
 
     ingest = result.phases["ingest"]
     assert ingest["rows"] == len(SAMPLE_ROWS)
@@ -189,7 +210,12 @@ def test_pipeline_handles_duplicate_column_headers():
     ).encode("utf-8")
 
     job_id = "job-duplicate-headers"
-    result = run_pipeline(job_id, {"key": "duplicate.csv"}, csv_payload, artifact_prefix=f"artifacts/{job_id}")
+    result = run_pipeline(
+        job_id,
+        {"key": "duplicate.csv"},
+        f"artifacts/{job_id}",
+        csv_payload,
+    )
 
     ingest = result.phases["ingest"]
     assert ingest["rows"] == 2

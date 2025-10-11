@@ -1,5 +1,5 @@
 // infra/stacks/core.ts
-import { Stack, StackProps, Duration, RemovalPolicy, CfnOutput } from "aws-cdk-lib";
+import { Stack, StackProps, Duration, RemovalPolicy, CfnOutput, Size } from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as path from "path";
 import { execSync } from "child_process";
@@ -147,19 +147,49 @@ export class MetricFoundryCoreStack extends Stack {
     // Processor Lambda: runs analytics pipeline after staging completes
     // Copies repo-local `services/` into the bundle so imports work.
     // =====================================================================
-    const processorCodePath = path.join(__dirname, "../../lambdas/processor");
-    const repoRoot = path.join(__dirname, "../../");
-    const servicesDir = path.join(repoRoot, "services");
+    const workerInvokeMode =
+      (this.node.tryGetContext("workerInvokeMode") as string | undefined) ?? "embedded";
+    const workerArn = this.node.tryGetContext("workerArn") as string | undefined;
+    const workerUrl = this.node.tryGetContext("workerUrl") as string | undefined;
+    const workerAuthHeader = this.node.tryGetContext("workerAuthHeader") as string | undefined;
+    const workerBearerToken = this.node.tryGetContext("workerBearerToken") as string | undefined;
+
+    const processorEnv: Record<string, string> = {
+      JOBS_TABLE: this.jobsTable.tableName,
+      TABLE_NAME: this.jobsTable.tableName,
+      ARTIFACTS_BUCKET: this.artifacts.bucketName,
+      WORKER_INVOKE_MODE: workerInvokeMode,
+    };
+
+    if (workerArn) {
+      processorEnv["WORKER_ARN"] = workerArn;
+    }
+    if (workerUrl) {
+      processorEnv["WORKER_URL"] = workerUrl;
+    }
+    if (workerAuthHeader) {
+      processorEnv["WORKER_AUTH_HEADER"] = workerAuthHeader;
+    }
+    if (workerBearerToken) {
+      processorEnv["WORKER_BEARER_TOKEN"] = workerBearerToken;
+    }
 
     const processorFn = new lambda.DockerImageFunction(this, "ProcessorFn", {
-  code: lambda.DockerImageCode.fromImageAsset("lambdas/processor"), // path directly to folder
-  timeout: Duration.minutes(15),
-  memorySize: 3008,
-  environment: {
-    JOBS_TABLE: this.jobsTable.tableName,
-    ARTIFACTS_BUCKET: this.artifacts.bucketName,
-  },
-});
+      code: lambda.DockerImageCode.fromImageAsset("lambdas/processor"), // path directly to folder
+      timeout: Duration.minutes(15),
+      memorySize: 3008,
+      environment: processorEnv,
+      ephemeralStorageSize: Size.mebibytes(10240),
+    });
+
+    if (workerArn) {
+      processorFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: ["lambda:InvokeFunction", "lambda:InvokeAsync"],
+          resources: [workerArn],
+        })
+      );
+    }
 
     this.artifacts.grantReadWrite(processorFn);
     this.jobsTable.grantReadWriteData(processorFn);
@@ -193,11 +223,13 @@ export class MetricFoundryCoreStack extends Stack {
       resultPath: sfn.JsonPath.DISCARD,
     });
 
-    const stageFailed = new sfn.Fail(this, "StageFailed");
-    stageTask.addCatch(markStageFailed.next(stageFailed), {
-      errors: ["States.ALL"],
-      resultPath: "$.stageError",
-    });
+    stageTask.addCatch(
+      markStageFailed.next(new sfn.Fail(this, "StageFailed")),
+      {
+        errors: ["States.ALL"],
+        resultPath: "$.stageError",
+      }
+    );
 
     const processTask = new tasks.LambdaInvoke(this, "ProcessJob", {
       lambdaFunction: processorFn,
@@ -225,8 +257,10 @@ export class MetricFoundryCoreStack extends Stack {
       resultPath: "$.processError",
     });
 
+    const finalizeState = new sfn.Succeed(this, "Finalize");
+
     this.jobsStateMachine = new sfn.StateMachine(this, "JobsStateMachine", {
-      definition: stageTask.next(processTask),
+      definition: stageTask.next(processTask).next(finalizeState),
       timeout: Duration.minutes(15),
     });
 
