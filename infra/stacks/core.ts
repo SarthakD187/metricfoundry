@@ -64,10 +64,24 @@ export class MetricFoundryCoreStack extends Stack {
     super(scope, id, props);
 
     // --- Artifacts bucket ---
+    const dashboardOrigin = process.env.FRONTEND_ORIGIN ?? "http://localhost:3000";
+
     this.artifacts = new s3.Bucket(this, "Artifacts", {
       versioned: true,
       enforceSSL: true,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      cors: [
+        {
+          allowedOrigins: [dashboardOrigin],
+          allowedMethods: [
+            s3.HttpMethods.PUT,
+            s3.HttpMethods.GET,
+            s3.HttpMethods.HEAD,
+          ],
+          allowedHeaders: ["*"],
+          exposedHeaders: ["ETag"],
+        },
+      ],
       lifecycleRules: [
         {
           transitions: [

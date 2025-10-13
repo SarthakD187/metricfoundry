@@ -17,6 +17,7 @@ export class MetricFoundryApiStack extends Stack {
     super(scope, id, props);
 
     const { artifactsBucket, jobsTable, workflow } = props;
+    const dashboardOrigin = process.env.FRONTEND_ORIGIN ?? "http://localhost:3000";
 
     // ------------------------------------------------------------------------
     // API Lambda (FastAPI + Mangum)
@@ -31,6 +32,7 @@ export class MetricFoundryApiStack extends Stack {
         BUCKET_NAME: artifactsBucket.bucketName,
         TABLE_NAME: jobsTable.tableName,
         STATE_MACHINE_ARN: workflow.stateMachineArn,
+        FRONTEND_ORIGIN: dashboardOrigin,
       },
     });
 
@@ -48,8 +50,11 @@ export class MetricFoundryApiStack extends Stack {
       apiName: "MetricFoundryApi",
       description: "FastAPI backend for MetricFoundry",
       corsPreflight: {
-        allowOrigins: ["*"],
+        allowOrigins: [dashboardOrigin],
         allowMethods: [apigwv2.CorsHttpMethod.ANY],
+        allowHeaders: ["*"],
+        exposeHeaders: ["*"],
+        allowCredentials: true,
       },
     });
 

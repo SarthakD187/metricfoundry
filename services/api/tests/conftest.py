@@ -148,6 +148,7 @@ def api_app(monkeypatch):
     monkeypatch.setenv("TABLE_NAME", "metricfoundry-jobs")
     monkeypatch.setenv("STATE_MACHINE_ARN", "arn:aws:states:local:stateMachine:metricfoundry")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setenv("FRONTEND_ORIGIN", "http://localhost:3000")
 
     from services.api import app as app_module
 
