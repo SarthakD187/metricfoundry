@@ -18,6 +18,8 @@ def test_create_upload_job_success(api_app):
     data = response.json()
     assert "jobId" in data
     assert data["uploadUrl"].startswith("https://")
+    assert "uploadHeaders" not in data
+    assert data["source"]["filename"] == "upload.csv"
 
     job_id = data["jobId"]
     job_response = client.get(f"/jobs/{job_id}")

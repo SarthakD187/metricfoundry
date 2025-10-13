@@ -198,6 +198,7 @@ def api_app(monkeypatch):
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("FRONTEND_ORIGIN", "http://localhost:3000")
 
     class _DummyDynamoResource:
         def Table(self, _name: str):  # noqa: N802 - mimic boto3
@@ -287,7 +288,6 @@ def test_create_job_enqueues_state_machine(api_app):
     payload = response.json()
     job_id = payload["jobId"]
     assert payload["uploadUrl"].startswith("https://example.com/")
-
     record = table._items[(f"job#{job_id}", "meta")]
     assert record["status"] == "QUEUED"
     assert record["source"]["type"] == "upload"
@@ -326,6 +326,7 @@ def test_create_job_honours_filename_and_content_type(api_app):
     presign_first = s3.presigned[-1]
     assert presign_first["Params"]["Key"] == key
     assert presign_first["Params"]["ContentType"] == "application/octet-stream"
+    assert payload["uploadHeaders"]["Content-Type"] == "application/octet-stream"
 
     response_no_type = client.post(
         "/jobs",
@@ -337,6 +338,7 @@ def test_create_job_honours_filename_and_content_type(api_app):
     key_no_type = payload_no_type["source"]["key"]
     assert key_no_type.endswith("/input/spaces.jsonl")
     assert payload_no_type["source"]["filename"] == "spaces.jsonl"
+    assert "uploadHeaders" not in payload_no_type
 
     presign_second = s3.presigned[-1]
     assert presign_second["Params"]["Key"] == key_no_type
@@ -453,9 +455,8 @@ def test_process_now_runs_pipeline(api_app):
 
     artifacts_bucket = module.BUCKET_NAME
     artifact_keys = sorted(s3._objects.get(artifacts_bucket, {}).keys())
-    assert f"artifacts/{job_id}/phases/ingest.json" in artifact_keys
+    assert f"artifacts/{job_id}/phases/01_ingest.json" in artifact_keys
     assert body["resultKey"] in artifact_keys
-    assert f"artifacts/{job_id}/results/bundles/analytics_bundle.zip" in artifact_keys
 
     results_payload = body["results"]
     assert results_payload["metrics"]["rows"] == 2

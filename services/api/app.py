@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ except Exception:  # ImportError in CI/local where mangum isn't installed
 BUCKET_NAME = os.environ["BUCKET_NAME"]          # artifacts bucket
 TABLE_NAME  = os.environ["TABLE_NAME"]           # DynamoDB table
 STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
+FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:3000")
 
 # ---- Logging & Observability ----
 logger = logging.getLogger("metricfoundry.api")
@@ -48,14 +50,11 @@ cloudwatch = boto3.client("cloudwatch")
 # ---- App ----
 app = FastAPI(title="MetricFoundry API")
 
-# --- CORS for local dashboard ---
+# --- CORS for dashboard ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_origins=[FRONTEND_ORIGIN],
+    allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
     allow_credentials=False,
@@ -142,26 +141,66 @@ def _build_sql_connection(config: Dict[str, object], *, source_label: str) -> Di
     return payload
 
 
-def _build_source(body: CreateJob, job_id: str) -> Tuple[dict, Optional[str]]:
-    """Return (source_metadata, upload_url?)."""
+DEFAULT_UPLOAD_FILENAME = "upload.csv"
+
+
+def _sanitize_upload_filename(filename: Optional[str]) -> str:
+    candidate = (filename or "").strip()
+    if not candidate:
+        return DEFAULT_UPLOAD_FILENAME
+    candidate = os.path.basename(candidate)
+    if not candidate:
+        return DEFAULT_UPLOAD_FILENAME
+    candidate = re.sub(r"[^A-Za-z0-9._-]+", "_", candidate)
+    candidate = re.sub(r"_+", "_", candidate)
+    segments = [segment for segment in candidate.split(".") if segment]
+    if not segments:
+        return DEFAULT_UPLOAD_FILENAME
+    if len(segments) == 1:
+        sanitized = segments[0]
+    else:
+        sanitized = ".".join((*segments[:-1], segments[-1]))
+    sanitized = sanitized.strip("._")
+    return sanitized or DEFAULT_UPLOAD_FILENAME
+
+
+def _build_source(body: CreateJob, job_id: str) -> Tuple[dict, Optional[str], Dict[str, str]]:
+    """Return (source_metadata, upload_url?, upload_headers)."""
     source_type = body.source_type
     config = _clean_config(body.source_config)
 
     if source_type == "upload":
-        key = f"artifacts/{job_id}/input/upload.csv"
+        filename = _sanitize_upload_filename(str(config.get("filename") or ""))
+        content_type = config.get("contentType")
+        if content_type is not None and not isinstance(content_type, str):
+            raise HTTPException(status_code=400, detail="contentType must be a string when provided")
+
+        key = f"artifacts/{job_id}/input/{filename}"
+        params: Dict[str, object] = {"Bucket": BUCKET_NAME, "Key": key}
+        upload_headers: Dict[str, str] = {}
+        if content_type:
+            params["ContentType"] = content_type
+            upload_headers["Content-Type"] = content_type
         upload_url = s3.generate_presigned_url(
             ClientMethod="put_object",
-            Params={"Bucket": BUCKET_NAME, "Key": key, "ContentType": "text/csv"},
+            Params=params,
             ExpiresIn=900,
         )
-        source = {"type": "upload", "bucket": BUCKET_NAME, "key": key}
-        return source, upload_url
+        source: Dict[str, object] = {
+            "type": "upload",
+            "bucket": BUCKET_NAME,
+            "key": key,
+            "filename": filename,
+        }
+        if content_type:
+            source["contentType"] = content_type
+        return source, upload_url, upload_headers
 
     if source_type == "s3":
         path = body.s3_path or config.get("uri") or config.get("path")
         if not path or not path.startswith("s3://"):
             raise HTTPException(status_code=400, detail="s3_path must be like s3://bucket/key")
-        return {"type": "s3", "uri": path}, None
+        return {"type": "s3", "uri": path}, None, {}
 
     if source_type in {"http", "https"}:
         url = config.get("url") or body.s3_path
@@ -183,7 +222,7 @@ def _build_source(body: CreateJob, job_id: str) -> Tuple[dict, Optional[str]]:
             "filename": config.get("filename"),
             "timeout": config.get("timeout"),
         }
-        return _clean_config(source), None
+        return _clean_config(source), None, {}
 
     if source_type == "database":
         query = config.get("query")
@@ -198,7 +237,7 @@ def _build_source(body: CreateJob, job_id: str) -> Tuple[dict, Optional[str]]:
             "format": config.get("format", "csv"),
             "connection": connection,
         }
-        return _clean_config(source), None
+        return _clean_config(source), None, {}
 
     if source_type == "warehouse":
         warehouse_type = (config.get("warehouseType") or config.get("type") or "").lower()
@@ -217,7 +256,7 @@ def _build_source(body: CreateJob, job_id: str) -> Tuple[dict, Optional[str]]:
             "format": config.get("format", "csv"),
             "connection": connection,
         }
-        return _clean_config(source), None
+        return _clean_config(source), None, {}
 
     raise HTTPException(status_code=400, detail="Unsupported source_type")
 
@@ -356,7 +395,7 @@ def create_job(body: CreateJob):
     dimensions = {"SourceType": body.source_type}
 
     try:
-        source, upload_url = _build_source(body, job_id)
+        source, upload_url, upload_headers = _build_source(body, job_id)
     except HTTPException:
         record_metric("JobValidationError", dimensions=dimensions)
         raise
@@ -400,7 +439,12 @@ def create_job(body: CreateJob):
 
     record_metric("JobCreated", dimensions=dimensions)
     logger.info("job queued", extra={"job_id": job_id, **dimensions})
-    return {"jobId": job_id, "uploadUrl": upload_url, "source": source}
+    response: Dict[str, object] = {"jobId": job_id, "source": source}
+    if upload_url:
+        response["uploadUrl"] = upload_url
+        if upload_headers:
+            response["uploadHeaders"] = upload_headers
+    return response
 
 
 @app.get("/jobs/{job_id}")
@@ -712,9 +756,10 @@ def process_now(job_id: str):
         ("99_finalize.json", finalize_payload),
     ]
     for fname, payload in phases:
+        key_with_prefix = f"{base}/phases/{fname}"
         s3.put_object(
             Bucket=BUCKET_NAME,
-            Key=f"{base}/phases/{fname}",
+            Key=key_with_prefix,
             Body=json.dumps(payload, indent=2).encode("utf-8"),
             ContentType="application/json",
         )
@@ -925,7 +970,13 @@ h1{{font-size:22px}} .kpi{{display:inline-block;margin-right:16px;padding:8px 12
             {"key": f"{base}/results/graphs/scatter_1.png", "contentType":"image/png"},
         ]
     }
-    s3.put_object(Bucket=BUCKET_NAME, Key=f"{base}/results/manifest.json", Body=json.dumps(results_manifest, indent=2).encode("utf-8"), ContentType="application/json")
+    results_manifest_key = f"{base}/results/manifest.json"
+    s3.put_object(
+        Bucket=BUCKET_NAME,
+        Key=results_manifest_key,
+        Body=json.dumps(results_manifest, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
 
     # --- parse_debug.json (for easy troubleshooting)
     try:
@@ -959,8 +1010,24 @@ h1{{font-size:22px}} .kpi{{display:inline-block;margin-right:16px;padding:8px 12
 
     # success
     results_key = f"{base}/results/results.json"
-    ddb_update_status(job_id, "SUCCEEDED", resultKey=results_key)
-    return {"ok": True, "resultKey": results_key}
+    results_summary = {
+        "metrics": {"rows": rows, "columns": columns, "bytesRead": data_bytes},
+        "summary": {"rows": rows, "columns": max(1, columns - 1) if columns else 0},
+        "links": {
+            "manifest": f"s3://{BUCKET_NAME}/{base}/manifest.json",
+            "resultsManifest": f"s3://{BUCKET_NAME}/{results_manifest_key}",
+            "resultsJson": f"s3://{BUCKET_NAME}/{results_key}",
+        },
+    }
+    ddb_update_status(job_id, "SUCCEEDED", resultKey=results_key, manifestKey=results_manifest_key)
+    record_metric("JobProcessed", dimensions={"SourceType": str(src.get("type") or "upload").lower()})
+    return {
+        "ok": True,
+        "jobId": job_id,
+        "resultKey": results_key,
+        "manifestKey": results_manifest_key,
+        "results": results_summary,
+    }
 
 
 # ---- Middleware ----
