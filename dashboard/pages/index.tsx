@@ -2,6 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import Head from "next/head";
+import { Authenticator } from "@aws-amplify/ui-react";
 import UploadForm from "../components/UploadForm";
 import JobCard from "../components/JobCard";
 import ResultsViewer from "../components/ResultsViewer";
@@ -15,14 +16,28 @@ import {
   type ResultsJson,
 } from "../lib/api";
 import { TrackedJob, usePersistentJobs } from "../hooks/usePersistentJobs";
+import { isAuthConfigured, startHostedUiSignIn } from "../lib/amplifyClient";
 
 const POLL_INTERVAL = 5000;
 
-export default function DashboardHome() {
+function DashboardContent({
+  user,
+  signOut,
+}: {
+  user: any | null;
+  signOut?: (() => void) | undefined;
+}) {
   const { jobs, addJob, updateJob, removeJob } = usePersistentJobs([]);
   const [globalError, setGlobalError] = useState<string | null>(null);
+  const [authRequired, setAuthRequired] = useState(false);
   const [existingJobId, setExistingJobId] = useState("");
   const [mounted, setMounted] = useState(false);
+  const loginId =
+    user?.signInDetails?.loginId ??
+    user?.username ??
+    user?.attributes?.email ??
+    user?.attributes?.preferred_username ??
+    null;
 
   // Latest finished result shown as a rich panel
   const [activeResult, setActiveResult] = useState<{
@@ -32,6 +47,41 @@ export default function DashboardHome() {
   } | null>(null);
 
   useEffect(() => setMounted(true), []);
+
+  const clearGlobalError = useCallback(() => {
+    setGlobalError(null);
+    setAuthRequired(false);
+  }, []);
+
+  const showError = useCallback((message: string) => {
+    setAuthRequired(false);
+    setGlobalError(message);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const handler = () => {
+      setAuthRequired(true);
+      setGlobalError("Please sign in to continue. Your session may have expired.");
+    };
+    window.addEventListener("metricfoundry:auth-required", handler);
+    return () => {
+      window.removeEventListener("metricfoundry:auth-required", handler);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (user) {
+      clearGlobalError();
+    }
+  }, [clearGlobalError, user]);
+
+  const handleSignIn = useCallback(() => {
+    if (!isAuthConfigured()) return;
+    startHostedUiSignIn().catch((error) => {
+      console.error("Failed to launch hosted UI sign-in", error);
+    });
+  }, []);
 
   const refreshJob = useCallback(
     async (jobId: string) => {
@@ -62,10 +112,10 @@ export default function DashboardHome() {
       } catch (error) {
         console.error("Failed to refresh job", error);
         const message = error instanceof Error ? error.message : "Unable to refresh job";
-        setGlobalError(message);
+        showError(message);
       }
     },
-    [updateJob],
+    [showError, updateJob],
   );
 
   // Local polling helper (replaces pollUntilComplete)
@@ -98,7 +148,7 @@ export default function DashboardHome() {
   );
 
   const handleJobCreated = useCallback(async (file: File | Blob) => {
-    setGlobalError(null);
+    clearGlobalError();
     try {
       const resp = await createUploadJob(file);
       const jobId = resp.jobId;
@@ -111,31 +161,31 @@ export default function DashboardHome() {
 
       // The UploadForm will call back with the actual file to PUT;
       // we return the tuple needed for it to continue.
-      return { jobId, uploadUrl: resp.uploadUrl! };
+      return { jobId, uploadUrl: resp.uploadUrl!, uploadHeaders: resp.uploadHeaders };
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to create job";
-      setGlobalError(msg);
+      showError(msg);
       throw e;
     }
-  }, [addJob]);
+  }, [addJob, clearGlobalError, showError]);
 
   const handleUpload = useCallback(
     async (jobId: string, _file: File | Blob) => {
-      setGlobalError(null);
+      clearGlobalError();
       try {
         updateJob(jobId, { uploadState: "uploading" });
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Upload failed";
-        setGlobalError(msg);
+        showError(msg);
         throw e;
       }
     },
-    [updateJob],
+    [clearGlobalError, showError, updateJob],
   );
 
   const handleUploadFinished = useCallback(
     async (jobId: string, _presignedUrlUsed: string) => {
-      setGlobalError(null);
+      clearGlobalError();
       try {
         updateJob(jobId, { uploadState: "uploaded" });
 
@@ -160,22 +210,23 @@ export default function DashboardHome() {
           setActiveResult({ jobId, json, downloadUrl: meta.downloadUrl });
           updateJob(jobId, { resultKey: meta.key, status: "SUCCEEDED" });
         } else {
-          setGlobalError(final.error || "Processing failed");
+          showError(final.error || "Processing failed");
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Processing failed";
-        setGlobalError(msg);
+        showError(msg);
       } finally {
         refreshJob(jobId);
       }
     },
-    [refreshJob, updateJob, waitForCompletion],
+    [clearGlobalError, refreshJob, showError, updateJob, waitForCompletion],
   );
 
   const handleExistingJobSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!existingJobId.trim()) return;
     const jobId = existingJobId.trim();
+    clearGlobalError();
     try {
       const response = await fetchJob(jobId);
       addJob({
@@ -202,7 +253,7 @@ export default function DashboardHome() {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to find job";
-      setGlobalError(message);
+      showError(message);
     }
   };
 
@@ -235,12 +286,41 @@ export default function DashboardHome() {
     return () => clearInterval(interval);
   }, [mounted, activeJobIds.join(","), refreshJob]);
 
+  const isSignedIn = Boolean(user);
+  const userLabel = isSignedIn ? "Signed in as" : "Guest mode";
+  const userName = isSignedIn ? loginId ?? "User" : "Authentication disabled";
+
   return (
     <>
       <Head>
         <title>MetricFoundry Dashboard</title>
       </Head>
       <main className="shell">
+        <div className="user-bar">
+          <div className="user-info">
+            <span className="user-label">{userLabel}</span>
+            <span className="user-name">{userName}</span>
+          </div>
+          {isSignedIn && signOut && (
+            <button
+              type="button"
+              className="signout-btn"
+              onClick={() => signOut?.()}
+            >
+              Sign out
+            </button>
+          )}
+        </div>
+        {globalError && (
+          <div className={`global-banner ${authRequired ? "auth" : "error"}`}>
+            <span>{globalError}</span>
+            {authRequired && isAuthConfigured() && (
+              <button type="button" onClick={handleSignIn} className="signin-cta">
+                Sign in
+              </button>
+            )}
+          </div>
+        )}
         <span className="aurora aurora-one" aria-hidden />
         <span className="aurora aurora-two" aria-hidden />
         <header className="masthead">
@@ -284,17 +364,17 @@ export default function DashboardHome() {
           <div className="hero-actions">
             <UploadForm
               onJobCreated={async (file) => {
-                const { jobId, uploadUrl } = await handleJobCreated(file);
+                const { jobId, uploadUrl, uploadHeaders } = await handleJobCreated(file);
                 return {
                   jobId,
                   upload: async (file: File | Blob) => {
-                    await uploadToPresigned(uploadUrl, file);
+                    await uploadToPresigned(uploadUrl, file, uploadHeaders);
                     await handleUpload(jobId, file);
                     await handleUploadFinished(jobId, uploadUrl);
                   },
                 };
               }}
-              onError={(message) => setGlobalError(message)}
+              onError={showError}
             />
 
             <form className="panel existing-job" onSubmit={handleExistingJobSubmit}>
@@ -322,8 +402,6 @@ export default function DashboardHome() {
             </form>
           </div>
         </section>
-
-        {globalError && <div className="toast toast-error">{globalError}</div>}
 
         {activeResult && (
           <section className="results-stage">
@@ -376,6 +454,46 @@ export default function DashboardHome() {
           display: flex;
           flex-direction: column;
           gap: clamp(2.5rem, 5vw, 4.5rem);
+        }
+        .user-bar {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 1rem;
+          padding: 0.75rem 1.25rem;
+          border-radius: 16px;
+          border: 1px solid rgba(224, 203, 168, 0.24);
+          background: rgba(13, 41, 46, 0.55);
+          box-shadow: 0 14px 40px rgba(10, 18, 22, 0.32);
+        }
+        .user-info {
+          display: flex;
+          flex-direction: column;
+          gap: 0.2rem;
+        }
+        .user-label {
+          font-size: 0.75rem;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          color: rgba(224, 203, 168, 0.56);
+        }
+        .user-name {
+          font-weight: 600;
+          color: #e0cba8;
+        }
+        .signout-btn {
+          background: rgba(224, 92, 84, 0.2);
+          border: 1px solid rgba(224, 92, 84, 0.6);
+          color: #ffaea3;
+          border-radius: 999px;
+          padding: 0.5rem 1.5rem;
+          font-size: 0.9rem;
+          cursor: pointer;
+          transition: background 0.2s ease, border-color 0.2s ease;
+        }
+        .signout-btn:hover {
+          background: rgba(224, 92, 84, 0.3);
+          border-color: rgba(224, 92, 84, 0.85);
         }
         .aurora {
           position: fixed;
@@ -596,14 +714,40 @@ export default function DashboardHome() {
           transform: translateY(-2px);
           box-shadow: 0 26px 60px -24px rgba(255, 101, 66, 0.85);
         }
-        .toast {
-          align-self: center;
-          padding: 0.75rem 1.5rem;
-          border-radius: 999px;
-          border: 1px solid rgba(255, 101, 66, 0.45);
-          color: #ff6542;
-          background: rgba(255, 101, 66, 0.12);
+        .global-banner {
+          align-self: stretch;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 1rem;
+          padding: 0.85rem 1.5rem;
+          border-radius: 16px;
+          border: 1px solid rgba(255, 101, 66, 0.35);
+          background: rgba(255, 101, 66, 0.14);
+          color: #ffcec1;
           font-weight: 600;
+          box-shadow: 0 16px 40px -32px rgba(255, 101, 66, 0.8);
+        }
+        .global-banner.auth {
+          border-color: rgba(132, 196, 222, 0.45);
+          background: rgba(132, 196, 222, 0.12);
+          color: #d6f0ff;
+        }
+        .signin-cta {
+          background: rgba(132, 196, 222, 0.22);
+          color: #ffffff;
+          border: 1px solid rgba(132, 196, 222, 0.6);
+          border-radius: 999px;
+          padding: 0.45rem 1.35rem;
+          font-size: 0.85rem;
+          font-weight: 600;
+          cursor: pointer;
+          transition: background 0.2s ease, border-color 0.2s ease;
+        }
+        .signin-cta:hover,
+        .signin-cta:focus-visible {
+          background: rgba(132, 196, 222, 0.35);
+          border-color: rgba(132, 196, 222, 0.85);
         }
         .results-stage {
           display: flex;
@@ -659,5 +803,18 @@ export default function DashboardHome() {
         }
       `}</style>
     </>
+  );
+}
+
+const authConfigured = isAuthConfigured();
+
+export default function DashboardHome() {
+  if (!authConfigured) {
+    return <DashboardContent user={null} />;
+  }
+  return (
+    <Authenticator>
+      {({ user, signOut }) => <DashboardContent user={user} signOut={signOut} />}
+    </Authenticator>
   );
 }

@@ -13,6 +13,8 @@ def metric_names(metric_calls):
 
 def test_create_upload_job_success(api_app):
     client = api_app["client"]
+    tenant = api_app["tenant"]
+    owner = api_app["owner"]
     response = client.post("/jobs", json={"source_type": "upload"})
     assert response.status_code == 200
     data = response.json()
@@ -20,12 +22,18 @@ def test_create_upload_job_success(api_app):
     assert data["uploadUrl"].startswith("https://")
     assert "uploadHeaders" not in data
     assert data["source"]["filename"] == "upload.csv"
+    expected_prefix = f"artifacts/{tenant}/{data['jobId']}"
+    assert data["artifactPrefix"] == expected_prefix
 
     job_id = data["jobId"]
     job_response = client.get(f"/jobs/{job_id}")
     assert job_response.status_code == 200
     job_payload = job_response.json()
     assert job_payload["status"] == "QUEUED"
+    assert job_payload["artifactPrefix"] == expected_prefix
+    assert job_payload["tenantId"] == tenant
+    assert job_payload["ownerSub"] == owner
+    assert job_payload["isPublic"] is False
 
     # Step Functions should have been triggered exactly once
     assert len(api_app["sfn"].executions) == 1
@@ -35,6 +43,34 @@ def test_create_upload_job_success(api_app):
     names = metric_names(api_app["cloudwatch"].metric_calls)
     assert "JobCreated" in names
     assert "JobQueued" in names
+
+
+def test_private_job_requires_authentication(api_app):
+    authed_client = api_app["client"]
+    anon_client = api_app["anon_client"]
+
+    create_resp = authed_client.post("/jobs", json={"source_type": "upload"})
+    assert create_resp.status_code == 200
+    job_id = create_resp.json()["jobId"]
+
+    anon_resp = anon_client.get(f"/jobs/{job_id}")
+    assert anon_resp.status_code == 404
+
+
+def test_public_job_visible_to_anonymous(api_app):
+    authed_client = api_app["client"]
+    anon_client = api_app["anon_client"]
+    module = api_app["module"]
+
+    create_resp = authed_client.post("/jobs", json={"source_type": "upload"})
+    assert create_resp.status_code == 200
+    job_id = create_resp.json()["jobId"]
+
+    module.table._items[(f"job#{job_id}", "meta")]["isPublic"] = True  # type: ignore[index]
+
+    anon_resp = anon_client.get(f"/jobs/{job_id}")
+    assert anon_resp.status_code == 200
+    assert anon_resp.json()["isPublic"] is True
 
 
 def test_create_job_validation_error(api_app):
@@ -49,6 +85,7 @@ def test_create_job_validation_error(api_app):
 def test_create_http_job(api_app):
     client = api_app["client"]
     module = api_app["module"]
+    tenant = api_app["tenant"]
     payload = {
         "source_type": "https",
         "source_config": {"url": "https://example.com/data.csv", "headers": {"Authorization": "Bearer token"}},
@@ -64,10 +101,12 @@ def test_create_http_job(api_app):
     assert record["source"]["type"] == "http"
     assert record["source"]["protocol"] == "https"
     assert record["source"]["url"] == "https://example.com/data.csv"
+    assert record["artifactPrefix"] == f"artifacts/{tenant}/{job_id}"
 
 
 def test_create_database_job_requires_config(api_app):
     client = api_app["client"]
+    tenant = api_app["tenant"]
     response = client.post("/jobs", json={"source_type": "database"})
     assert response.status_code == 400
     assert "database jobs require query" in response.json()["detail"]
@@ -95,10 +134,12 @@ def test_create_database_job_requires_config(api_app):
     assert record["source"]["format"] == "jsonl"
     assert record["source"]["connection"]["type"] == "inline"
     assert record["source"]["connection"]["url"] == "sqlite:///tmp/example.db"
+    assert record["artifactPrefix"] == f"artifacts/{tenant}/{job_id}"
 
 
 def test_create_database_job_with_secret(api_app):
     client = api_app["client"]
+    tenant = api_app["tenant"]
     response = client.post(
         "/jobs",
         json={
@@ -116,6 +157,7 @@ def test_create_database_job_with_secret(api_app):
     assert record["source"]["connection"]["type"] == "secretsManager"
     assert record["source"]["connection"]["secretArn"].endswith(":database")
     assert record["source"]["connection"]["secretField"] == "url"
+    assert record["artifactPrefix"] == f"artifacts/{tenant}/{job_id}"
 
 
 def test_create_database_job_rejects_multiple_connections(api_app):
@@ -137,6 +179,7 @@ def test_create_database_job_rejects_multiple_connections(api_app):
 
 def test_create_warehouse_job_validation(api_app):
     client = api_app["client"]
+    tenant = api_app["tenant"]
     response = client.post(
         "/jobs",
         json={
@@ -165,36 +208,39 @@ def test_create_warehouse_job_validation(api_app):
     assert record["source"]["filename"] == "warehouse-output.csv"
     assert record["source"]["connection"]["type"] == "secretsManager"
     assert record["source"]["connection"]["secretArn"].endswith(":warehouse")
+    assert record["artifactPrefix"].startswith(f"artifacts/{tenant}/")
 
 
 @pytest.mark.parametrize("path,expected_status", [(None, 200), ("data.csv", 200), ("missing.csv", 404)])
 def test_manifest_and_results_browsing(api_app, path, expected_status):
     client = api_app["client"]
     module = api_app["module"]
+    tenant = api_app["tenant"]
 
     create_resp = client.post("/jobs", json={"source_type": "upload"})
     assert create_resp.status_code == 200
     job_id = create_resp.json()["jobId"]
+    base_prefix = f"artifacts/{tenant}/{job_id}"
 
     manifest = {"inputs": ["upload.csv"], "results": ["results.json"]}
     module.s3.put_object(
         Bucket=module.BUCKET_NAME,
-        Key=f"artifacts/{job_id}/manifest.json",
+        Key=f"{base_prefix}/manifest.json",
         Body=json.dumps(manifest),
     )
     module.s3.put_object(
         Bucket=module.BUCKET_NAME,
-        Key=f"artifacts/{job_id}/results/results.json",
+        Key=f"{base_prefix}/results/results.json",
         Body=json.dumps({"rowCount": 1}),
     )
     module.s3.put_object(
         Bucket=module.BUCKET_NAME,
-        Key=f"artifacts/{job_id}/results/data.csv",
+        Key=f"{base_prefix}/results/data.csv",
         Body="value\n1\n",
     )
     module.s3.put_object(
         Bucket=module.BUCKET_NAME,
-        Key=f"artifacts/{job_id}/results/subdir/details.json",
+        Key=f"{base_prefix}/results/subdir/details.json",
         Body=json.dumps({"score": 10}),
     )
 
@@ -205,24 +251,24 @@ def test_manifest_and_results_browsing(api_app, path, expected_status):
     artifacts_resp = client.get(f"/jobs/{job_id}/artifacts")
     assert artifacts_resp.status_code == 200
     listed_keys = {obj["key"] for obj in artifacts_resp.json()["objects"]}
-    assert f"artifacts/{job_id}/manifest.json" in listed_keys
+    assert f"{base_prefix}/manifest.json" in listed_keys
     common_prefixes = set(artifacts_resp.json().get("commonPrefixes", []))
-    assert f"artifacts/{job_id}/results/" in common_prefixes
+    assert f"{base_prefix}/results/" in common_prefixes
 
     filtered_resp = client.get(
         f"/jobs/{job_id}/artifacts",
-        params={"prefix": f"artifacts/{job_id}/results/"},
+        params={"prefix": f"{base_prefix}/results/"},
     )
     assert filtered_resp.status_code == 200
     filtered_keys = {obj["key"] for obj in filtered_resp.json()["objects"]}
-    assert all(key.startswith(f"artifacts/{job_id}/results/") for key in filtered_keys)
+    assert all(key.startswith(f"{base_prefix}/results/") for key in filtered_keys)
 
     files_resp = client.get(f"/jobs/{job_id}/results/files")
     assert files_resp.status_code == 200
     file_keys = {obj["key"] for obj in files_resp.json()["objects"]}
-    assert f"artifacts/{job_id}/results/data.csv" in file_keys
-    assert f"artifacts/{job_id}/results/subdir/details.json" not in file_keys
-    assert f"artifacts/{job_id}/results/subdir/" in files_resp.json()["commonPrefixes"]
+    assert f"{base_prefix}/results/data.csv" in file_keys
+    assert f"{base_prefix}/results/subdir/details.json" not in file_keys
+    assert f"{base_prefix}/results/subdir/" in files_resp.json()["commonPrefixes"]
 
     params = {"path": path} if path else {}
     download_resp = client.get(f"/jobs/{job_id}/results", params=params)
@@ -247,23 +293,27 @@ def test_results_listing_without_files(api_app):
 
 def test_artifact_prefix_outside_job_is_rejected(api_app):
     client = api_app["client"]
+    tenant = api_app["tenant"]
     create_resp = client.post("/jobs", json={"source_type": "upload"})
     job_id = create_resp.json()["jobId"]
+    base_prefix = f"artifacts/{tenant}/{job_id}"
 
     resp = client.get(f"/jobs/{job_id}/artifacts", params={"prefix": "other/"})
     assert resp.status_code == 400
 
     resp = client.get(
         f"/jobs/{job_id}/artifacts",
-        params={"prefix": f"artifacts/{job_id}/../other"},
+        params={"prefix": f"{base_prefix}/../other"},
     )
     assert resp.status_code == 400
 
 
 def test_results_path_outside_job_is_rejected(api_app):
     client = api_app["client"]
+    tenant = api_app["tenant"]
     create_resp = client.post("/jobs", json={"source_type": "upload"})
     job_id = create_resp.json()["jobId"]
+    base_prefix = f"artifacts/{tenant}/{job_id}"
 
     resp = client.get(
         f"/jobs/{job_id}/results",

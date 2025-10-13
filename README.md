@@ -42,7 +42,7 @@ are bundled into `results.json` for downstream consumption.
 
 The pipeline is defensive against messy data: schema inference treats zero-only
 columns and sparsely populated fields as categorical, metrics such as dataset
-completeness exclude recognised null sentinels, and quantile / standard
+completeness exclude recognized null sentinels, and quantile / standard
 deviation calculations use numerically stable streaming algorithms. Extremely
 large files may still exceed the Lambda's available memory or timeout budget,
 but those cases surface explicit failure events and error artifacts so you can
@@ -112,3 +112,29 @@ NEXT_PUBLIC_API_BASE_URL="https://your-api.example.com" npm run dashboard:dev
 
 The dashboard persists recently viewed job IDs in local storage so you can revisit
 completed runs without re-querying DynamoDB.
+
+### Deployment configuration
+
+Deployments that wire the dashboard to Cognito and the HTTP API require a small
+set of environment variables. Provide the following values when building or
+hosting the Next.js app:
+
+| Variable | Description |
+| --- | --- |
+| `NEXT_PUBLIC_COGNITO_USER_POOL_ID` | ID of the Cognito user pool created by `AuthStack`. |
+| `NEXT_PUBLIC_COGNITO_USER_POOL_CLIENT_ID` | ID of the same user pool client attached to the API authorizer. |
+| `NEXT_PUBLIC_COGNITO_DOMAIN` | Fully qualified hosted UI domain (e.g. `yourprefix.auth.us-east-1.amazoncognito.com`). |
+| `NEXT_PUBLIC_AWS_REGION` | AWS region where the user pool and API reside (falls back to `NEXT_PUBLIC_COGNITO_REGION` or `NEXT_PUBLIC_REGION` if unset). |
+| `NEXT_PUBLIC_API_URL` | Deployed HTTPS URL of the API Gateway HTTP API (alias of `NEXT_PUBLIC_API_BASE_URL`). |
+| `NEXT_PUBLIC_API_BASE_URL` | Alternate name recognized by the dashboard for backwards compatibility with local setup docs. |
+| `NEXT_PUBLIC_OAUTH_REDIRECT_SIGN_IN` | Redirect URI registered on the user pool client for sign-in. |
+| `NEXT_PUBLIC_OAUTH_REDIRECT_SIGN_OUT` | Redirect URI registered on the user pool client for sign-out. |
+| `NEXT_PUBLIC_ALLOW_ID_TOKEN_AS_BEARER` | Optional; set to `true` for local dev if you need to fall back to ID tokens when access tokens are unavailable. |
+
+> **Note:** Ensure the dashboard uses the same Cognito app client as the API's
+> `HttpUserPoolAuthorizer` so the JWT audience matches. The hosted UI domain
+> must be the full Cognito domain name; the SDK derives the issuer URL from it.
+
+On the infrastructure side, supply the `FRONTEND_ORIGIN` environment variable or
+CDK context entry when deploying `ApiStack` so CORS preflight responses allow the
+hosted dashboard to call the API.

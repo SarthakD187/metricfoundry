@@ -215,6 +215,7 @@ export class MetricFoundryCoreStack extends Stack {
       lambdaFunction: stageFn,
       payload: sfn.TaskInput.fromObject({
         jobId: sfn.JsonPath.stringAt("$.jobId"),
+        artifactPrefix: sfn.JsonPath.stringAt("$.artifactPrefix"),
       }),
       resultPath: "$.stage",
       payloadResponseOnly: true,
@@ -249,6 +250,7 @@ export class MetricFoundryCoreStack extends Stack {
       lambdaFunction: processorFn,
       payload: sfn.TaskInput.fromObject({
         jobId: sfn.JsonPath.stringAt("$.jobId"),
+        artifactPrefix: sfn.JsonPath.stringAt("$.artifactPrefix"),
         input: sfn.JsonPath.stringAt("$.stage.input"),
       }),
       resultPath: "$.process",

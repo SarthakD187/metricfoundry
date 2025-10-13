@@ -1,8 +1,13 @@
 import type { AppProps } from 'next/app';
 import Head from 'next/head';
 import '../styles/globals.css';
+import '@aws-amplify/ui-react/styles.css';
+import { ensureAmplifyConfigured } from '../lib/amplifyClient';
+
+ensureAmplifyConfigured();
 
 export default function MetricFoundryApp({ Component, pageProps }: AppProps) {
+
   return (
     <>
       <Head>

@@ -1,10 +1,14 @@
 // dashboard/lib/api.ts
 
+import { fetchAuthSession } from 'aws-amplify/auth';
+
 // ---- Types ----
 export interface CreateJobResponse {
   jobId: string;
   uploadUrl?: string;
+  uploadHeaders?: Record<string, string>;
   source?: Record<string, unknown> | null;
+  artifactPrefix: string;
 }
 
 export type JobStatus = "CREATED" | "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED";
@@ -17,6 +21,10 @@ export interface JobStatusResponse {
   resultKey?: string | null;
   source?: Record<string, unknown> | null;
   error?: string | null;
+  artifactPrefix?: string;
+  tenantId?: string;
+  ownerSub?: string;
+  isPublic?: boolean;
 }
 
 export interface ArtifactObjectSummary {
@@ -83,6 +91,11 @@ const rawBase =
 
 const API_BASE = rawBase.replace(/\/$/, "");
 
+const allowIdTokenAsBearer = (() => {
+  const raw = process.env.NEXT_PUBLIC_ALLOW_ID_TOKEN_AS_BEARER ?? "false";
+  return /^(1|true|t|yes)$/i.test(raw.trim());
+})();
+
 if (typeof window !== "undefined") {
   (window as any).__API_BASE = API_BASE || "http://127.0.0.1:8000";
 }
@@ -99,9 +112,41 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const base = API_BASE || "http://127.0.0.1:8000";
   const url = joinUrl(base, path);
   let response: Response;
+  let authHeaders: Record<string, string> = {};
+  if (typeof window !== 'undefined') {
+    try {
+      const session = await fetchAuthSession();
+      const accessToken = session.tokens?.accessToken?.toString();
+      const idToken = session.tokens?.idToken?.toString();
+      let token: string | undefined;
+      if (accessToken) {
+        token = accessToken;
+      } else if (allowIdTokenAsBearer && idToken) {
+        token = idToken;
+        // eslint-disable-next-line no-console
+        console.warn('Access token missing; falling back to ID token for API call.');
+      } else if (idToken) {
+        // eslint-disable-next-line no-console
+        console.warn('Access token missing and ID token fallback disabled; request will be anonymous.');
+      }
+      if (token) {
+        authHeaders = { Authorization: `Bearer ${token}` };
+      } else if (session.tokens) {
+        // eslint-disable-next-line no-console
+        console.warn('Authenticated session missing Cognito access token; request will be anonymous.');
+      }
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.warn('Unable to load auth session', error);
+    }
+  }
   try {
     response = await fetch(url, {
-      headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeaders,
+        ...(init?.headers || {}),
+      },
       ...init,
     });
   } catch (error) {
@@ -112,6 +157,13 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(networkMessage ?? (error instanceof Error ? error.message : "Request failed"));
   }
   if (!response.ok) {
+    if (response.status === 401) {
+      // eslint-disable-next-line no-console
+      console.warn('API request returned 401; prompting the user to sign in again.');
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('metricfoundry:auth-required'));
+      }
+    }
     const payload = await safeJson(response);
     const msg = (payload && (payload.detail || payload.message)) || `${response.status} ${response.statusText}`;
     throw new Error(msg);
@@ -187,10 +239,17 @@ export async function processJobNow(jobId: string): Promise<{ ok: boolean; resul
   return apiFetch<{ ok: boolean; resultKey?: string }>(`jobs/${encodeURIComponent(jobId)}/process`, { method: "POST" });
 }
 
-export async function uploadToPresigned(url: string, file: File | Blob): Promise<void> {
-  const headers: Record<string, string> = {};
-  if (typeof file.type === "string" && file.type.trim() !== "") {
-    headers["content-type"] = file.type;
+export async function uploadToPresigned(
+  url: string,
+  file: File | Blob,
+  extraHeaders?: Record<string, string>,
+): Promise<void> {
+  const headers: Record<string, string> = extraHeaders ? { ...extraHeaders } : {};
+  const hasContentTypeHeader = Object.keys(headers).some(
+    (key) => key.toLowerCase() === "content-type",
+  );
+  if (!hasContentTypeHeader && typeof file.type === "string" && file.type.trim() !== "") {
+    headers["Content-Type"] = file.type;
   }
   const r = await fetch(url, { method: "PUT", headers, body: file });
   if (!r.ok) throw new Error(`Upload failed: ${r.status} ${r.statusText}`);

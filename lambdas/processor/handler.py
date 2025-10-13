@@ -329,8 +329,9 @@ def main(event, _ctx):
     except Exception as e:
         print(f"[ProcessorFn] Warning: failed to upsert initial RUNNING status: {e}")
 
-    artifact_prefix = f"artifacts/{job_id}"
-    results_key = result_key_for(job_id)
+    artifact_prefix_raw = event.get("artifactPrefix") or event.get("artifact_prefix")
+    artifact_prefix = (artifact_prefix_raw or f"artifacts/{job_id}").rstrip("/")
+    results_key = result_key_for(job_id, artifact_prefix)
 
     try:
         if ARTIFACTS_BUCKET and object_exists(s3, ARTIFACTS_BUCKET, results_key):
@@ -380,6 +381,7 @@ def main(event, _ctx):
             target_bucket,
             result,
             s3_client=s3,
+            artifact_prefix=artifact_prefix,
         )
 
         results_payload = build_results_payload(
@@ -387,6 +389,7 @@ def main(event, _ctx):
             result,
             source_input=source_descriptor,
             artifact_bucket=target_bucket,
+            artifact_prefix=artifact_prefix,
         )
 
         # Best-effort parse debug to aid troubleshooting
@@ -396,6 +399,7 @@ def main(event, _ctx):
                 target_bucket,
                 result.phases.get("profile", {}) or {},
                 s3_client=s3,
+                artifact_prefix=artifact_prefix,
             )
         except Exception:
             pass
@@ -432,7 +436,7 @@ def main(event, _ctx):
 
         try:
             target_bucket = ARTIFACTS_BUCKET or bucket
-            error_key = error_key_for(job_id)
+            error_key = error_key_for(job_id, artifact_prefix)
             s3.put_object(
                 Bucket=target_bucket,
                 Key=error_key,

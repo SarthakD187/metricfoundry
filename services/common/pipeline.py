@@ -18,24 +18,35 @@ else:  # pragma: no cover - at runtime we treat PipelineResult as ``Any``
 ANALYSIS_VERSION = "2024.05"
 
 
-def result_key_for(job_id: str) -> str:
-    return f"artifacts/{job_id}/results/results.json"
+def _base_prefix(job_id: str, artifact_prefix: Optional[str] = None) -> str:
+    if artifact_prefix and str(artifact_prefix).strip():
+        return str(artifact_prefix).rstrip("/")
+    return f"artifacts/{job_id}"
 
 
-def manifest_key_for(job_id: str) -> str:
-    return f"artifacts/{job_id}/results/manifest.json"
+def result_key_for(job_id: str, artifact_prefix: Optional[str] = None) -> str:
+    base = _base_prefix(job_id, artifact_prefix)
+    return f"{base}/results/results.json"
 
 
-def phase_key_for(job_id: str, phase: str) -> str:
-    return f"artifacts/{job_id}/phases/{phase}.json"
+def manifest_key_for(job_id: str, artifact_prefix: Optional[str] = None) -> str:
+    base = _base_prefix(job_id, artifact_prefix)
+    return f"{base}/results/manifest.json"
 
 
-def error_key_for(job_id: str) -> str:
-    return f"artifacts/{job_id}/results/error.json"
+def phase_key_for(job_id: str, phase: str, artifact_prefix: Optional[str] = None) -> str:
+    base = _base_prefix(job_id, artifact_prefix)
+    return f"{base}/phases/{phase}.json"
 
 
-def artifact_key_for(job_id: str, relative: str) -> str:
-    return f"artifacts/{job_id}/{relative}"
+def error_key_for(job_id: str, artifact_prefix: Optional[str] = None) -> str:
+    base = _base_prefix(job_id, artifact_prefix)
+    return f"{base}/results/error.json"
+
+
+def artifact_key_for(job_id: str, relative: str, artifact_prefix: Optional[str] = None) -> str:
+    base = _base_prefix(job_id, artifact_prefix)
+    return f"{base}/{relative}".replace("//", "/")
 
 
 def _json_bytes(data: Any) -> bytes:
@@ -114,6 +125,7 @@ def persist_pipeline_outputs(
     result: "PipelineResult",
     *,
     s3_client,
+    artifact_prefix: Optional[str] = None,
 ) -> Dict[str, str]:
     """Upload phase payloads and generated artifacts to S3.
 
@@ -122,7 +134,7 @@ def persist_pipeline_outputs(
 
     uploaded: Dict[str, str] = {}
     for phase, payload in result.phases.items():
-        key = phase_key_for(job_id, phase)
+        key = phase_key_for(job_id, phase, artifact_prefix)
         s3_client.put_object(
             Bucket=bucket,
             Key=key,
@@ -132,7 +144,7 @@ def persist_pipeline_outputs(
         uploaded[f"phase:{phase}"] = key
 
     for relative_key, spec in result.artifact_contents.items():
-        key = artifact_key_for(job_id, relative_key)
+        key = artifact_key_for(job_id, relative_key, artifact_prefix)
         body = _bytes_for_artifact(spec)
         content_type = _content_type_for_artifact(relative_key, spec)
         s3_client.put_object(
@@ -142,7 +154,7 @@ def persist_pipeline_outputs(
             ContentType=content_type,
         )
 
-    manifest_key = manifest_key_for(job_id)
+    manifest_key = manifest_key_for(job_id, artifact_prefix)
     s3_client.put_object(
         Bucket=bucket,
         Key=manifest_key,
@@ -207,6 +219,7 @@ def build_results_payload(
     source_input: Optional[Mapping[str, Any]] = None,
     artifact_bucket: Optional[str] = None,
     analysis_version: str = ANALYSIS_VERSION,
+    artifact_prefix: Optional[str] = None,
 ) -> Dict[str, Any]:
     metrics = dict(result.metrics)
     profile_phase = (
@@ -260,8 +273,8 @@ def build_results_payload(
             links["input"] = f"s3://{bucket}/{key}"
 
     if artifact_bucket:
-        links["resultsManifest"] = f"s3://{artifact_bucket}/{manifest_key_for(job_id)}"
-        links["resultsJson"] = f"s3://{artifact_bucket}/{result_key_for(job_id)}"
+        links["resultsManifest"] = f"s3://{artifact_bucket}/{manifest_key_for(job_id, artifact_prefix)}"
+        links["resultsJson"] = f"s3://{artifact_bucket}/{result_key_for(job_id, artifact_prefix)}"
 
     payload = {
         "jobId": job_id,
@@ -276,7 +289,9 @@ def build_results_payload(
         "outliers": result.outliers,
         "mlInference": result.ml_inference,
         "artifactManifest": result.manifest,
-        "phaseArtifactKeys": {phase: phase_key_for(job_id, phase) for phase in result.phases},
+        "phaseArtifactKeys": {
+            phase: phase_key_for(job_id, phase, artifact_prefix) for phase in result.phases
+        },
     }
 
     return payload
@@ -288,6 +303,7 @@ def emit_parse_debug(
     profile_phase: Mapping[str, Any],
     *,
     s3_client,
+    artifact_prefix: Optional[str] = None,
 ) -> Optional[str]:
     try:
         debug: Dict[str, Any] = {}
@@ -312,7 +328,7 @@ def emit_parse_debug(
                 if isinstance(column, Mapping) and column.get("name")
             ][:50]
 
-        key = artifact_key_for(job_id, "results/parse_debug.json")
+        key = artifact_key_for(job_id, "results/parse_debug.json", artifact_prefix)
         s3_client.put_object(
             Bucket=bucket,
             Key=key,

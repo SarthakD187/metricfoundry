@@ -126,6 +126,13 @@ class SourceRef:
         return self.key.rsplit("/", 1)[-1]
 
 
+def _job_artifact_prefix(item: Dict[str, object], job_id: str) -> str:
+    prefix = item.get("artifactPrefix")
+    if isinstance(prefix, str) and prefix.strip():
+        return prefix.rstrip("/")
+    return f"artifacts/{job_id}"
+
+
 @dataclass
 class StagedArtifact:
     bucket: str
@@ -160,7 +167,7 @@ def _filename_from_headers(response, url: str) -> str:
     return _safe_filename(os.path.basename(parsed.path), "http-download")
 
 
-def _download_http_source(job_id: str, source: Dict[str, object]) -> SourceRef:
+def _download_http_source(job_id: str, artifact_prefix: str, source: Dict[str, object]) -> SourceRef:
     url = source.get("url")
     if not isinstance(url, str):
         raise ValueError("HTTP source missing url")
@@ -177,7 +184,7 @@ def _download_http_source(job_id: str, source: Dict[str, object]) -> SourceRef:
         raise ValueError(f"HTTP connector received status {response.status_code} from {url}")
 
     filename = _safe_filename(source.get("filename"), _filename_from_headers(response, url))
-    key = f"artifacts/{job_id}/input/{filename}"
+    key = f"{artifact_prefix}/input/{filename}"
 
     s3.put_object(
         Bucket=ARTIFACTS_BUCKET,
@@ -303,7 +310,13 @@ def _resolve_sql_connection(source: Dict[str, object]) -> str:
     )
 
 
-def _extract_sql_source(job_id: str, source: Dict[str, object], *, default_name: str) -> SourceRef:
+def _extract_sql_source(
+    job_id: str,
+    artifact_prefix: str,
+    source: Dict[str, object],
+    *,
+    default_name: str,
+) -> SourceRef:
     query = source.get("query")
     if not isinstance(query, str):
         raise ValueError("SQL source requires a query")
@@ -345,13 +358,13 @@ def _extract_sql_source(job_id: str, source: Dict[str, object], *, default_name:
     finally:
         engine.dispose()
 
-    key = f"artifacts/{job_id}/input/{filename}"
+    key = f"{artifact_prefix}/input/{filename}"
     s3.put_object(Bucket=ARTIFACTS_BUCKET, Key=key, Body=payload, ContentType=content_type)
 
     return SourceRef(ARTIFACTS_BUCKET, key)
 
 
-def _resolve_source(job_id: str, item: Dict[str, Dict]) -> Tuple[SourceRef, str]:
+def _resolve_source(job_id: str, artifact_prefix: str, item: Dict[str, Dict]) -> Tuple[SourceRef, str]:
     source = item.get("source") or {}
     source_type = source.get("type")
 
@@ -374,15 +387,15 @@ def _resolve_source(job_id: str, item: Dict[str, Dict]) -> Tuple[SourceRef, str]
 
     if source_type == "http":
         protocol = source.get("protocol") or "http"
-        return _download_http_source(job_id, source), protocol
+        return _download_http_source(job_id, artifact_prefix, source), protocol
 
     if source_type == "database":
-        ref = _extract_sql_source(job_id, source, default_name="database-export.csv")
+        ref = _extract_sql_source(job_id, artifact_prefix, source, default_name="database-export.csv")
         return ref, source_type
 
     if source_type == "warehouse":
         warehouse_type = source.get("warehouseType") or "warehouse"
-        ref = _extract_sql_source(job_id, source, default_name=f"{warehouse_type}-export.csv")
+        ref = _extract_sql_source(job_id, artifact_prefix, source, default_name=f"{warehouse_type}-export.csv")
         return ref, f"warehouse:{warehouse_type}"
 
     raise ValueError(f"Unsupported source type: {source_type}")
@@ -457,9 +470,9 @@ def _detect_format(key: str, content_type: Optional[str]) -> str:
     return "unknown"
 
 
-def _stage_source(job_id: str, src: SourceRef) -> StagedArtifact:
+def _stage_source(job_id: str, artifact_prefix: str, src: SourceRef) -> StagedArtifact:
     filename = src.filename or "source"
-    dest_key = f"artifacts/{job_id}/input/{filename}"
+    dest_key = f"{artifact_prefix}/input/{filename}"
 
     _copy_object(src, dest_key)
 
@@ -488,7 +501,8 @@ def handler(event, _context):
     if not item:
         raise ValueError(f"Job {job_id} not found")
 
-    src, source_type = _resolve_source(job_id, item)
+    artifact_prefix = _job_artifact_prefix(item, job_id)
+    src, source_type = _resolve_source(job_id, artifact_prefix, item)
 
     # Mark job as staging (idempotent)
     _ddb_update(job_id, STATUS_STAGING)
@@ -497,7 +511,7 @@ def handler(event, _context):
         _wait_for_upload(src)
 
     try:
-        staged = _stage_source(job_id, src)
+        staged = _stage_source(job_id, artifact_prefix, src)
     except FileNotReadyError:
         # Should never reach here due to early check, but propagate just in case.
         raise
@@ -528,4 +542,5 @@ def handler(event, _context):
         "jobId": job_id,
         "input": {"bucket": staged.bucket, "key": staged.key},
         "metadata": metadata,
+        "artifactPrefix": artifact_prefix,
     }
