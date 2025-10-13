@@ -1,6 +1,9 @@
 import importlib
 import io
+import base64
 import hashlib
+import io
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -142,6 +145,12 @@ class FakeCloudWatch:
         return {"ResponseMetadata": {"HTTPStatusCode": 200}}
 
 
+def _make_mock_jwt(claims: dict[str, object]) -> str:
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "none", "typ": "JWT"}).encode("utf-8")).decode("ascii").rstrip("=")
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{header}.{payload}."
+
+
 @pytest.fixture()
 def api_app(monkeypatch):
     monkeypatch.setenv("BUCKET_NAME", "metricfoundry-artifacts")
@@ -149,6 +158,8 @@ def api_app(monkeypatch):
     monkeypatch.setenv("STATE_MACHINE_ARN", "arn:aws:states:local:stateMachine:metricfoundry")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     monkeypatch.setenv("FRONTEND_ORIGIN", "http://localhost:3000")
+    monkeypatch.setenv("ALLOW_ANONYMOUS_JOB_CREATION", "false")
+    monkeypatch.setenv("ALLOW_UNVERIFIED_LOCAL_JWT", "true")
 
     from services.api import app as app_module
 
@@ -164,12 +175,23 @@ def api_app(monkeypatch):
     app_module.sfn = fake_sfn
     app_module.cloudwatch = fake_cw
 
+    tenant = "tenant-test"
+    claims = {"sub": "test-sub", "custom:tenant": tenant, "email": "tester@example.com"}
+    token = _make_mock_jwt(claims)
+    default_headers = {"Authorization": f"Bearer {token}"}
+
     transport = httpx.ASGITransport(app=app_module.app)
     async_client = httpx.AsyncClient(transport=transport, base_url="http://testserver")
 
     class SyncClient:
-        def request(self, method: str, url: str, **kwargs):
-            return anyio.run(lambda: async_client.request(method, url, **kwargs))
+        def __init__(self, headers: dict[str, str]):
+            self._headers = headers
+
+        def request(self, method: str, url: str, headers: dict[str, str] | None = None, **kwargs):
+            merged = dict(self._headers)
+            if headers:
+                merged.update(headers)
+            return anyio.run(lambda: async_client.request(method, url, headers=merged, **kwargs))
 
         def get(self, url: str, **kwargs):
             return self.request("GET", url, **kwargs)
@@ -177,7 +199,8 @@ def api_app(monkeypatch):
         def post(self, url: str, **kwargs):
             return self.request("POST", url, **kwargs)
 
-    client = SyncClient()
+    client = SyncClient(default_headers)
+    anon_client = SyncClient({})
 
     try:
         yield {
@@ -185,6 +208,9 @@ def api_app(monkeypatch):
             "module": app_module,
             "sfn": fake_sfn,
             "cloudwatch": fake_cw,
+            "tenant": tenant,
+            "owner": claims["sub"],
+            "anon_client": anon_client,
         }
     finally:
         anyio.run(async_client.aclose)

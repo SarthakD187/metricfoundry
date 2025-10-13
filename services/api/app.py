@@ -9,13 +9,14 @@ import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Tuple, TYPE_CHECKING
 
 import boto3
 from botocore.exceptions import ClientError
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -31,12 +32,36 @@ BUCKET_NAME = os.environ["BUCKET_NAME"]          # artifacts bucket
 TABLE_NAME  = os.environ["TABLE_NAME"]           # DynamoDB table
 STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
 FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:3000")
+ALLOW_ANONYMOUS_JOB_CREATION = os.environ.get("ALLOW_ANONYMOUS_JOB_CREATION", "false").lower() in {
+    "1",
+    "true",
+    "t",
+    "yes",
+}
+ANONYMOUS_TENANT_PREFIX = os.environ.get("ANONYMOUS_TENANT_PREFIX", "public")
+TENANT_CLAIM_KEYS: Tuple[str, ...] = (
+    "custom:tenant",
+    "custom:tenantId",
+    "tenant",
+    "tenantId",
+)
+ALLOW_UNVERIFIED_LOCAL_JWT = os.environ.get("ALLOW_UNVERIFIED_LOCAL_JWT", "false").lower() in {
+    "1",
+    "true",
+    "t",
+    "yes",
+}
 
 # ---- Logging & Observability ----
 logger = logging.getLogger("metricfoundry.api")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 logger.setLevel(logging.INFO)
+
+if ALLOW_UNVERIFIED_LOCAL_JWT:
+    logger.warning(
+        "ALLOW_UNVERIFIED_LOCAL_JWT enabled – DO NOT USE IN PRODUCTION",
+    )
 
 METRICS_NAMESPACE = os.environ.get("METRICS_NAMESPACE", "MetricFoundry/API")
 
@@ -59,6 +84,110 @@ app.add_middleware(
     expose_headers=["*"],
     allow_credentials=False,
 )
+
+# ---- Auth helpers ----
+
+@dataclass
+class AuthContext:
+    sub: str
+    username: Optional[str]
+    tenant_id: Optional[str]
+    claims: Dict[str, object]
+
+    @property
+    def owner_segment(self) -> str:
+        return self.tenant_id or self.sub
+
+
+def _sanitize_owner_segment(raw: str) -> str:
+    candidate = (raw or "").strip()
+    if not candidate:
+        return "user"
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", candidate)
+    cleaned = re.sub(r"[-_.]+$", "", cleaned)
+    cleaned = re.sub(r"^[-_.]+", "", cleaned)
+    if not cleaned:
+        return "user"
+    return cleaned.lower()
+
+
+def _decode_unverified_jwt(token: str) -> Optional[Dict[str, object]]:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    payload_segment = parts[1]
+    padding = "=" * (-len(payload_segment) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode((payload_segment + padding).encode("ascii"))
+        data = json.loads(decoded.decode("utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _extract_claims(request: Request) -> Optional[Dict[str, object]]:
+    event = request.scope.get("aws.event") if isinstance(request.scope, dict) else None
+    if isinstance(event, dict):
+        jwt_ctx = (
+            event.get("requestContext", {})
+            .get("authorizer", {})
+            .get("jwt")
+        )
+        if isinstance(jwt_ctx, dict):
+            claims = jwt_ctx.get("claims")
+            if isinstance(claims, dict):
+                return claims
+
+    if not ALLOW_UNVERIFIED_LOCAL_JWT:
+        return None
+
+    auth_header = request.headers.get("authorization")
+    if auth_header and auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
+        payload = _decode_unverified_jwt(token)
+        if payload:
+            logger.debug("Using unverified JWT claims from Authorization header (local testing enabled).")
+            return payload
+    return None
+
+
+def _build_auth_context(claims: Dict[str, object]) -> Optional[AuthContext]:
+    sub_val = claims.get("sub")
+    if not isinstance(sub_val, str) or not sub_val.strip():
+        return None
+    sub = sub_val.strip()
+    tenant_id: Optional[str] = None
+    for key in TENANT_CLAIM_KEYS:
+        value = claims.get(key)
+        if isinstance(value, str) and value.strip():
+            tenant_id = value.strip()
+            break
+    username_val = claims.get("cognito:username") or claims.get("username")
+    username = str(username_val).strip() if isinstance(username_val, str) else None
+    return AuthContext(sub=sub, username=username, tenant_id=tenant_id, claims=dict(claims))
+
+
+def get_identity(request: Request) -> Optional[AuthContext]:
+    claims = _extract_claims(request)
+    if not claims:
+        return None
+    return _build_auth_context(claims)
+
+
+def require_identity(request: Request) -> AuthContext:
+    identity = get_identity(request)
+    if identity is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return identity
+
+
+def optional_identity(request: Request) -> Optional[AuthContext]:
+    return get_identity(request)
+
+
+def artifact_prefix_for(job_id: str, owner_segment: str) -> str:
+    segment = _sanitize_owner_segment(owner_segment)
+    return f"artifacts/{segment}/{job_id}"
 
 # ---- Models ----
 class CreateJob(BaseModel):
@@ -164,10 +293,15 @@ def _sanitize_upload_filename(filename: Optional[str]) -> str:
     return sanitized or DEFAULT_UPLOAD_FILENAME
 
 
-def _build_source(body: CreateJob, job_id: str) -> Tuple[dict, Optional[str], Dict[str, str]]:
+def _build_source(
+    body: CreateJob,
+    job_id: str,
+    artifact_base: str,
+) -> Tuple[dict, Optional[str], Dict[str, str]]:
     """Return (source_metadata, upload_url?, upload_headers)."""
     source_type = body.source_type
     config = _clean_config(body.source_config)
+    base_prefix = artifact_base.rstrip("/")
 
     if source_type == "upload":
         filename = _sanitize_upload_filename(str(config.get("filename") or ""))
@@ -175,7 +309,7 @@ def _build_source(body: CreateJob, job_id: str) -> Tuple[dict, Optional[str], Di
         if content_type is not None and not isinstance(content_type, str):
             raise HTTPException(status_code=400, detail="contentType must be a string when provided")
 
-        key = f"artifacts/{job_id}/input/{filename}"
+        key = f"{base_prefix}/input/{filename}"
         params: Dict[str, object] = {"Bucket": BUCKET_NAME, "Key": key}
         upload_headers: Dict[str, str] = {}
         if content_type:
@@ -204,7 +338,7 @@ def _build_source(body: CreateJob, job_id: str) -> Tuple[dict, Optional[str], Di
 
     if source_type in {"http", "https"}:
         url = config.get("url") or body.s3_path
-        if not url or not url.startswith("http"):
+        if not url:
             raise HTTPException(status_code=400, detail="source_config.url is required for http jobs")
         method = (config.get("method") or "GET").upper()
         if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
@@ -275,15 +409,31 @@ def epoch() -> int:
     return int(time.time())
 
 
-def ddb_put_job(job_id: str, status: str, source: dict, created: int):
-    item = {
+def ddb_put_job(
+    job_id: str,
+    status: str,
+    source: dict,
+    created: int,
+    *,
+    owner_sub: str,
+    tenant_id: Optional[str],
+    artifact_prefix: str,
+    is_public: bool = False,
+):
+    item: Dict[str, object] = {
         "pk": f"job#{job_id}",
         "sk": "meta",
         "status": status,
         "createdAt": created,
         "updatedAt": created,
         "source": source,
+        "ownerSub": owner_sub,
+        "artifactPrefix": artifact_prefix,
     }
+    if tenant_id:
+        item["tenantId"] = tenant_id
+    if is_public:
+        item["isPublic"] = True
     table.put_item(Item=item, ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)")
     return item
 
@@ -308,10 +458,31 @@ def ddb_update_status(job_id: str, status: str, **attrs):
     )
 
 
-def ensure_job(job_id: str) -> dict:
+def ensure_job(job_id: str, identity: Optional[AuthContext] = None) -> dict:
     res = table.get_item(Key={"pk": f"job#{job_id}", "sk": "meta"})
     item = res.get("Item")
     if not item:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    is_public = bool(item.get("isPublic"))
+    if identity is None:
+        if not is_public:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return item
+
+    owner_sub = item.get("ownerSub")
+    tenant_id = item.get("tenantId")
+    allowed = is_public
+    if not allowed and isinstance(owner_sub, str) and owner_sub == identity.sub:
+        allowed = True
+    if (
+        not allowed
+        and isinstance(tenant_id, str)
+        and identity.tenant_id
+        and tenant_id == identity.tenant_id
+    ):
+        allowed = True
+    if not allowed:
         raise HTTPException(status_code=404, detail="Job not found")
     return item
 
@@ -379,23 +550,53 @@ def ddb_item_to_job(job_id: str, item: dict) -> dict:
         "resultKey": item.get("resultKey"),
         "source": item.get("source"),
         "error": item.get("error"),
+        "artifactPrefix": item.get("artifactPrefix"),
+        "tenantId": item.get("tenantId"),
+        "ownerSub": item.get("ownerSub"),
+        "isPublic": item.get("isPublic", False),
     }
 
 
 # ---- Routes ----
+def job_artifact_base(job_id: str, item: dict) -> str:
+    prefix = item.get("artifactPrefix")
+    if isinstance(prefix, str) and prefix.strip():
+        return prefix.rstrip("/")
+    return f"artifacts/{job_id}"
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
 @app.post("/jobs")
-def create_job(body: CreateJob):
+def create_job(body: CreateJob, identity: Optional[AuthContext] = Depends(optional_identity)):
+    if identity is None and not ALLOW_ANONYMOUS_JOB_CREATION:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
     job_id = str(uuid.uuid4())
     now = epoch()
-    dimensions = {"SourceType": body.source_type}
+
+    if identity is None:
+        owner_sub = ANONYMOUS_TENANT_PREFIX
+        tenant_id = None
+        owner_segment = ANONYMOUS_TENANT_PREFIX
+        is_public = True
+    else:
+        owner_sub = identity.sub
+        tenant_id = identity.tenant_id
+        owner_segment = identity.owner_segment
+        is_public = False
+
+    artifact_prefix = artifact_prefix_for(job_id, owner_segment)
+
+    dimensions: Dict[str, str] = {"SourceType": body.source_type}
+    if tenant_id:
+        dimensions["Tenant"] = tenant_id
 
     try:
-        source, upload_url, upload_headers = _build_source(body, job_id)
+        source, upload_url, upload_headers = _build_source(body, job_id, artifact_prefix)
     except HTTPException:
         record_metric("JobValidationError", dimensions=dimensions)
         raise
@@ -403,16 +604,32 @@ def create_job(body: CreateJob):
         record_metric("JobValidationError", dimensions=dimensions)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    logger.info("creating job", extra={"job_id": job_id, **dimensions})
+    logger.info(
+        "creating job",
+        extra={"job_id": job_id, "tenant": tenant_id, "owner": owner_sub, **dimensions},
+    )
 
     try:
-        ddb_put_job(job_id, status="CREATED", source=source, created=now)
+        ddb_put_job(
+            job_id,
+            status="CREATED",
+            source=source,
+            created=now,
+            owner_sub=owner_sub,
+            tenant_id=tenant_id,
+            artifact_prefix=artifact_prefix,
+            is_public=is_public,
+        )
     except ClientError as e:
         logger.exception("failed to persist job", extra={"job_id": job_id})
         record_metric("JobPersistenceFailed", dimensions=dimensions)
         raise HTTPException(status_code=502, detail="Unable to persist job") from e
 
-    execution_input = json.dumps({"jobId": job_id})
+    execution_payload: Dict[str, object] = {"jobId": job_id, "artifactPrefix": artifact_prefix}
+    if tenant_id:
+        execution_payload["tenantId"] = tenant_id
+    execution_payload["ownerSub"] = owner_sub
+    execution_input = json.dumps(execution_payload)
     execution_name = f"job-{job_id}".replace("/", "-")
 
     try:
@@ -439,7 +656,7 @@ def create_job(body: CreateJob):
 
     record_metric("JobCreated", dimensions=dimensions)
     logger.info("job queued", extra={"job_id": job_id, **dimensions})
-    response: Dict[str, object] = {"jobId": job_id, "source": source}
+    response: Dict[str, object] = {"jobId": job_id, "source": source, "artifactPrefix": artifact_prefix}
     if upload_url:
         response["uploadUrl"] = upload_url
         if upload_headers:
@@ -448,15 +665,16 @@ def create_job(body: CreateJob):
 
 
 @app.get("/jobs/{job_id}")
-def get_job(job_id: str):
-    item = ensure_job(job_id)
+def get_job(job_id: str, identity: Optional[AuthContext] = Depends(optional_identity)):
+    item = ensure_job(job_id, identity)
     return ddb_item_to_job(job_id, item)
 
 
 @app.get("/jobs/{job_id}/manifest")
-def get_job_manifest(job_id: str):
-    ensure_job(job_id)
-    key = f"artifacts/{job_id}/manifest.json"
+def get_job_manifest(job_id: str, identity: Optional[AuthContext] = Depends(optional_identity)):
+    item = ensure_job(job_id, identity)
+    base = job_artifact_base(job_id, item)
+    key = f"{base}/manifest.json"
     try:
         obj = s3.get_object(Bucket=BUCKET_NAME, Key=key)
     except ClientError as e:
@@ -486,9 +704,10 @@ def list_job_artifacts(
     continuation_token: Optional[str] = Query(default=None, alias="continuationToken"),
     page_size: int = Query(default=100, alias="pageSize", ge=1, le=1000),
     delimiter: Optional[str] = Query(default="/", description="Delimiter used for common prefixes; empty to disable"),
+    identity: Optional[AuthContext] = Depends(optional_identity),
 ):
-    ensure_job(job_id)
-    base_prefix = f"artifacts/{job_id}/"
+    item = ensure_job(job_id, identity)
+    base_prefix = f"{job_artifact_base(job_id, item)}/"
     target_prefix = validate_prefix(job_id, prefix, base=base_prefix)
 
     kwargs = {
@@ -520,9 +739,10 @@ def list_job_result_files(
     job_id: str,
     continuation_token: Optional[str] = Query(default=None, alias="continuationToken"),
     page_size: int = Query(default=100, alias="pageSize", ge=1, le=1000),
+    identity: Optional[AuthContext] = Depends(optional_identity),
 ):
-    ensure_job(job_id)
-    prefix = f"artifacts/{job_id}/results/"
+    item = ensure_job(job_id, identity)
+    prefix = f"{job_artifact_base(job_id, item)}/results/"
     kwargs = {
         "Bucket": BUCKET_NAME,
         "Prefix": prefix,
@@ -548,12 +768,16 @@ def list_job_result_files(
 
 
 @app.get("/jobs/{job_id}/results")
-def get_job_results(job_id: str, path: Optional[str] = Query(default=None, description="Relative path within the job's results directory")):
+def get_job_results(
+    job_id: str,
+    path: Optional[str] = Query(default=None, description="Relative path within the job's results directory"),
+    identity: Optional[AuthContext] = Depends(optional_identity),
+):
     """Return a presigned download URL for a results file.
     Defaults to artifacts/{job_id}/results/results.json
     """
-    ensure_job(job_id)
-    prefix = _normalize_s3_path(f"artifacts/{job_id}/results/")
+    item = ensure_job(job_id, identity)
+    prefix = _normalize_s3_path(f"{job_artifact_base(job_id, item)}/results/")
     relative = path.lstrip("/") if path else "results.json"
     prefix_no_trailing = prefix[:-1] if prefix.endswith("/") else prefix
     key = _normalize_s3_path(f"{prefix_no_trailing}/{relative}")
@@ -578,12 +802,17 @@ def get_job_results(job_id: str, path: Optional[str] = Query(default=None, descr
 
 
 @app.get("/jobs/{job_id}/download")
-def presign_any(job_id: str, key: str = Query(..., description="Full S3 key inside artifacts/{job_id}/...")):
-    ensure_job(job_id)
-    base_prefix = f"artifacts/{job_id}/"
+def presign_any(
+    job_id: str,
+    key: str = Query(..., description="Full S3 key inside artifacts/{job_id}/..."),
+    identity: Optional[AuthContext] = Depends(optional_identity),
+):
+    item = ensure_job(job_id, identity)
+    base_prefix = f"{job_artifact_base(job_id, item)}/"
     norm = _normalize_s3_path(key)
-    if not norm.startswith(base_prefix):
-        raise HTTPException(status_code=400, detail="key must be within artifacts/{job_id}/")
+    base_norm = _normalize_s3_path(base_prefix)
+    if not norm.startswith(base_norm):
+        raise HTTPException(status_code=400, detail="key must be within this job's artifacts")
     try:
         s3.head_object(Bucket=BUCKET_NAME, Key=norm)
     except ClientError as e:
@@ -601,7 +830,7 @@ def presign_any(job_id: str, key: str = Query(..., description="Full S3 key insi
 
 # --- Dev/manual processing endpoint to emit the full artifact layout ---
 @app.post("/jobs/{job_id}/process")
-def process_now(job_id: str):
+def process_now(job_id: str, identity: AuthContext = Depends(require_identity)):
     """
     Dev/manual processor that infers CSV shape, writes phases/*, and results/*.
     Produces correct rows/columns/schema and real descriptive stats/correlations/outliers.
@@ -609,7 +838,7 @@ def process_now(job_id: str):
     import csv
     from collections import Counter
 
-    job = ensure_job(job_id)
+    job = ensure_job(job_id, identity)
     src = job.get("source") or {}
     bucket = src.get("bucket")
     key    = src.get("key")
@@ -618,7 +847,7 @@ def process_now(job_id: str):
 
     ddb_update_status(job_id, "RUNNING")
     now_iso = datetime.now(timezone.utc).isoformat()
-    base = f"artifacts/{job_id}"
+    base = job_artifact_base(job_id, job)
 
     # --- Read entire object (ok for small CSVs; switch to chunking if needed)
     obj = s3.get_object(Bucket=bucket, Key=key)
