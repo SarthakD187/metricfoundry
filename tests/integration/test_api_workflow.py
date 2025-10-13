@@ -199,6 +199,7 @@ def api_app(monkeypatch):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("FRONTEND_ORIGIN", "http://localhost:3000")
+    monkeypatch.setenv("ALLOW_ANONYMOUS_JOB_CREATION", "true")
 
     class _DummyDynamoResource:
         def Table(self, _name: str):  # noqa: N802 - mimic boto3
@@ -268,6 +269,9 @@ def api_app(monkeypatch):
     module.table = fake_table
     module.sfn = fake_sfn
     module.cloudwatch = fake_cloudwatch
+    stub_identity = SimpleNamespace(sub="public", tenant_id=None, owner_segment="public")
+    module.app.dependency_overrides[module.require_identity] = lambda: stub_identity
+    module.app.dependency_overrides[module.optional_identity] = lambda: stub_identity
 
     client = ApiClient(module.app)
 
@@ -294,7 +298,8 @@ def test_create_job_enqueues_state_machine(api_app):
 
     assert len(sfn.executions) == 1
     execution = sfn.executions[0]
-    assert json.loads(execution["input"]) == {"jobId": job_id}
+    execution_payload = json.loads(execution["input"])
+    assert execution_payload["jobId"] == job_id
     assert execution["stateMachineArn"] == module.STATE_MACHINE_ARN
 
     metric_names = [metric["MetricName"] for metric in cloudwatch.metrics]
@@ -386,6 +391,7 @@ def test_artifact_and_results_endpoints(api_app):
             "updatedAt": 1700000001,
             "source": {"type": "upload"},
             "resultKey": f"artifacts/{job_id}/results/results.json",
+            "isPublic": True,
         }
     )
 
@@ -431,6 +437,7 @@ def test_process_now_runs_pipeline(api_app):
             "createdAt": 1700000100,
             "updatedAt": 1700000100,
             "source": {"type": "upload", "bucket": source_bucket, "key": source_key},
+            "isPublic": True,
         }
     )
 

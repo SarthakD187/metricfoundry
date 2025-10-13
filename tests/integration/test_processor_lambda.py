@@ -135,12 +135,15 @@ def test_stage_and_processor_pipeline(
     staged_key = stage_result["input"]["key"]
 
     if patch_parquet:
-        graph_module = importlib.import_module("services.workers.graph.graph")
+        ingest_module = importlib.import_module("services.workers.graph.io.ingest")
 
         def _parquet_as_csv(data: bytes):
-            return graph_module._ingest_csv("dataset.parquet", data)
+            return ingest_module._ingest_csv("dataset.parquet", data)
 
-        monkeypatch.setattr(graph_module, "_ingest_parquet", _parquet_as_csv)
+        monkeypatch.setattr(
+            "services.workers.graph.io.ingest._ingest_parquet",
+            _parquet_as_csv,
+        )
 
     response = processor_module.main({"jobId": job_id, "input": stage_result["input"]}, None)
 

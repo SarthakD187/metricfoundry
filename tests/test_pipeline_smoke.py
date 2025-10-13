@@ -78,6 +78,7 @@ def env_guard():
 def test_pipeline_no_checkpoint(env_guard, tmp_path):
     # Disable checkpointing
     os.environ["MF_DISABLE_CHECKPOINT"] = "1"
+    os.environ["CHECKPOINT_SQLITE_PATH"] = str(tmp_path / "graph.ckpt.sqlite")
 
     res = run_pipeline(
         "pytest-smoke-no-ckpt",
