@@ -9,12 +9,15 @@ remains unchanged.
 import base64
 import csv
 import io
+import ipaddress
 import json
 import os
+import socket
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from importlib import import_module
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import boto3
@@ -31,6 +34,26 @@ ssm = boto3.client("ssm")
 
 TABLE_NAME = os.environ["JOBS_TABLE"]
 ARTIFACTS_BUCKET = os.environ["ARTIFACTS_BUCKET"]
+DEFAULT_MAX_HTTP_BYTES = 10 * 1024 * 1024
+
+
+def _load_max_http_bytes() -> int:
+    raw_value = os.environ.get("MAX_HTTP_BYTES")
+    if raw_value is None or not str(raw_value).strip():
+        return DEFAULT_MAX_HTTP_BYTES
+
+    try:
+        parsed = int(str(raw_value).strip())
+    except ValueError as exc:  # pragma: no cover - configuration error
+        raise ValueError("MAX_HTTP_BYTES must be an integer") from exc
+
+    if parsed <= 0:
+        raise ValueError("MAX_HTTP_BYTES must be greater than zero")
+
+    return parsed
+
+
+MAX_HTTP_BYTES = _load_max_http_bytes()
 
 STATUS_STAGING = "STAGING"
 STATUS_STAGED = "STAGED"
@@ -126,6 +149,25 @@ class SourceRef:
         return self.key.rsplit("/", 1)[-1]
 
 
+@dataclass
+class HttpDownload:
+    url: str
+    filename: str
+    content: bytes
+    content_type: Optional[str]
+
+
+@dataclass
+class HttpStagingResult:
+    original: "StagedArtifact"
+    normalized: "StagedArtifact"
+    manifest: Dict[str, object]
+    manifest_key: str
+    format: str
+    schema_sample: List[str]
+    row_count: Optional[int]
+
+
 def _job_artifact_prefix(item: Dict[str, object], job_id: str) -> str:
     prefix = item.get("artifactPrefix")
     if isinstance(prefix, str) and prefix.strip():
@@ -152,6 +194,72 @@ def _safe_filename(name: Optional[str], fallback: str) -> str:
     return candidate or fallback
 
 
+def _resolve_host_ips(hostname: str) -> List[str]:
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+        except socket.gaierror as exc:
+            raise ValueError(f"Unable to resolve hostname {hostname}: {exc}") from exc
+
+        addresses: List[str] = []
+        for info in infos:
+            sockaddr = info[4]
+            if not sockaddr:
+                continue
+            ip = sockaddr[0]
+            if ip not in addresses:
+                addresses.append(ip)
+        if not addresses:
+            raise ValueError(f"Unable to resolve hostname {hostname}")
+        return addresses
+
+    return [hostname]
+
+
+def _ensure_public_destination(hostname: str) -> None:
+    for ip in _resolve_host_ips(hostname):
+        addr = ipaddress.ip_address(ip)
+        if not addr.is_global:
+            raise ValueError(
+                f"HTTP connector disallows private or link-local address {ip} for host {hostname}"
+            )
+
+
+def _validate_http_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("HTTP connector only supports http and https URLs")
+    if not parsed.hostname:
+        raise ValueError("HTTP connector requires a hostname")
+
+    _ensure_public_destination(parsed.hostname)
+
+    return url
+
+
+def _coerce_timeout(value) -> Tuple[float, float]:
+    if value is None:
+        return (5.0, 20.0)
+
+    if isinstance(value, (int, float)):
+        timeout = float(value)
+        if timeout <= 0:
+            raise ValueError("HTTP connector timeout must be positive")
+        return (timeout, timeout)
+
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        connect, read = value
+        connect_timeout = float(connect)
+        read_timeout = float(read)
+        if connect_timeout <= 0 or read_timeout <= 0:
+            raise ValueError("HTTP connector timeout must be positive")
+        return (connect_timeout, read_timeout)
+
+    raise ValueError("HTTP connector timeout must be a number or [connect, read] tuple")
+
+
 def _filename_from_headers(response, url: str) -> str:
     disposition = response.headers.get("Content-Disposition")
     if disposition:
@@ -167,33 +275,290 @@ def _filename_from_headers(response, url: str) -> str:
     return _safe_filename(os.path.basename(parsed.path), "http-download")
 
 
-def _download_http_source(job_id: str, artifact_prefix: str, source: Dict[str, object]) -> SourceRef:
+def _download_http_source(job_id: str, _artifact_prefix: str, source: Dict[str, object]) -> HttpDownload:
     url = source.get("url")
     if not isinstance(url, str):
         raise ValueError("HTTP source missing url")
+
+    url = _validate_http_url(url.strip())
 
     method = str(source.get("method") or "GET").upper()
     headers = source.get("headers") or {}
     if not isinstance(headers, dict):
         raise ValueError("HTTP headers must be a mapping")
     body = source.get("body")
-    timeout = source.get("timeout") or 30
+    timeout = _coerce_timeout(source.get("timeout"))
 
-    response = requests.request(method, url, headers=headers, data=body, timeout=timeout)
-    if response.status_code >= 400:
-        raise ValueError(f"HTTP connector received status {response.status_code} from {url}")
+    response = requests.request(
+        method,
+        url,
+        headers=headers,
+        data=body,
+        timeout=timeout,
+        stream=True,
+        allow_redirects=False,
+    )
 
-    filename = _safe_filename(source.get("filename"), _filename_from_headers(response, url))
-    key = f"{artifact_prefix}/input/{filename}"
+    try:
+        if response.status_code >= 400 or 300 <= response.status_code < 400:
+            raise ValueError(f"HTTP connector received status {response.status_code} from {url}")
 
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            try:
+                length_value = int(content_length)
+            except ValueError:
+                raise ValueError("HTTP connector received invalid Content-Length header")
+            if length_value > MAX_HTTP_BYTES:
+                raise ValueError("HTTP connector download exceeds configured MAX_HTTP_BYTES")
+
+        buffer = bytearray()
+        for chunk in response.iter_content(chunk_size=1024 * 64):
+            if not chunk:
+                continue
+            buffer.extend(chunk)
+            if len(buffer) > MAX_HTTP_BYTES:
+                raise ValueError("HTTP connector download exceeds configured MAX_HTTP_BYTES")
+
+        filename = _safe_filename(source.get("filename"), _filename_from_headers(response, url))
+        content_type = response.headers.get("Content-Type")
+
+        return HttpDownload(url=url, filename=filename, content=bytes(buffer), content_type=content_type)
+    finally:
+        response.close()
+
+
+def _extension_from_content_type(content_type: Optional[str]) -> str:
+    if not content_type:
+        return ""
+    ct = content_type.split(";", 1)[0].strip().lower()
+    if "json" in ct:
+        return ".json"
+    if "csv" in ct:
+        return ".csv"
+    if "tsv" in ct or "tab-separated" in ct:
+        return ".tsv"
+    return ""
+
+
+def _infer_original_extension(filename: str, content_type: Optional[str]) -> str:
+    name = filename.lower()
+    if "." in name and not name.endswith("."):
+        _, ext = os.path.splitext(name)
+        if ext:
+            return ext
+    return _extension_from_content_type(content_type)
+
+
+def _content_type_for_extension(extension: str) -> Optional[str]:
+    ext = extension.lower().lstrip(".")
+    if ext in {"json", "jsonl", "ndjson"}:
+        return "application/json"
+    if ext == "csv":
+        return "text/csv"
+    if ext == "tsv":
+        return "text/tab-separated-values"
+    return None
+
+
+def _schema_sample_from_mappings(records: Sequence[object], limit: int = 10) -> List[str]:
+    seen: List[str] = []
+    for entry in records[:limit]:
+        if isinstance(entry, dict):
+            for key in entry.keys():
+                key_str = str(key)
+                if key_str not in seen:
+                    seen.append(key_str)
+    return seen
+
+
+def _normalise_http_download(download: HttpDownload) -> Tuple[bytes, str, List[str], Optional[int], str, str]:
+    """Return (normalized_bytes, format, schema_sample, row_count, normalized_ext, content_type)."""
+
+    filename = download.filename.lower()
+    content_type = (download.content_type or "").lower()
+
+    is_json = filename.endswith((".json", ".jsonl", ".ndjson")) or "json" in content_type
+    is_tsv = filename.endswith(".tsv") or "tsv" in content_type or "tab-separated" in content_type
+    is_csv = filename.endswith(".csv") or ("csv" in content_type and not is_tsv)
+
+    if not is_json and not is_csv and not is_tsv:
+        sample = download.content[:1024].decode("utf-8", errors="ignore")
+        stripped = sample.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            is_json = True
+        else:
+            first_line = sample.splitlines()[0] if sample else ""
+            if "\t" in first_line:
+                is_tsv = True
+            elif "," in first_line:
+                is_csv = True
+
+    if is_json:
+        text = download.content.decode("utf-8-sig", errors="replace")
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            # Treat as JSON Lines
+            records: List[object] = []
+            for line in text.splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    records.append(json.loads(stripped))
+                except json.JSONDecodeError as exc:
+                    raise ValueError("JSON Lines payload contains invalid JSON record") from exc
+
+            schema_sample = _schema_sample_from_mappings(records)
+            row_count = len(records)
+            lines = [json.dumps(item, default=_json_default) for item in records]
+            normalized = "\n".join(lines).encode("utf-8")
+            return normalized, "jsonl", schema_sample, row_count, ".jsonl", "application/json"
+
+        if isinstance(parsed, dict) and isinstance(parsed.get("data"), list):
+            records = parsed["data"]
+        else:
+            records = parsed
+
+        if not isinstance(records, list):
+            raise ValueError("JSON payload must be an array or object with data array")
+
+        schema_sample = _schema_sample_from_mappings(records)
+        row_count = len(records)
+        lines = [json.dumps(item, default=_json_default) for item in records]
+        normalized = "\n".join(lines).encode("utf-8")
+        return normalized, "jsonl", schema_sample, row_count, ".jsonl", "application/json"
+
+    if is_csv or is_tsv:
+        text = download.content.decode("utf-8-sig", errors="replace")
+        reader = list(csv.reader(io.StringIO(text), delimiter="\t" if is_tsv else ","))
+        header: List[str] = []
+        if reader:
+            header = [str(col) for col in reader[0]]
+        schema_sample = header
+        row_count = max(len(reader) - 1, 0) if reader else 0
+        ext = ".tsv" if is_tsv else ".csv"
+        ctype = "text/tab-separated-values" if is_tsv else "text/csv"
+        fmt = "tsv" if is_tsv else "csv"
+        return download.content, fmt, schema_sample, row_count, ext, ctype
+
+    raise ValueError("HTTP connector only supports CSV or JSON responses")
+
+
+def _build_http_manifest(
+    job_id: str,
+    artifact_prefix: str,
+    download: HttpDownload,
+    original: "StagedArtifact",
+    normalized: "StagedArtifact",
+    *,
+    fmt: str,
+    schema_sample: Sequence[str],
+    row_count: Optional[int],
+) -> Tuple[Dict[str, object], str]:
+    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    manifest = {
+        "jobId": job_id,
+        "generatedAt": generated_at,
+        "source": {"type": "http", "url": download.url},
+        "format": fmt,
+        "schemaSample": list(schema_sample),
+        "rowCountEstimate": row_count,
+        "artifacts": [
+            {
+                "name": "original",
+                "bucket": original.bucket,
+                "key": original.key,
+                "bytes": original.size,
+                "contentType": original.content_type,
+            },
+            {
+                "name": "normalized",
+                "bucket": normalized.bucket,
+                "key": normalized.key,
+                "bytes": normalized.size,
+                "contentType": normalized.content_type,
+                "format": fmt,
+                "schemaSample": list(schema_sample),
+                "rowCountEstimate": row_count,
+            },
+        ],
+    }
+
+    key = f"{artifact_prefix}/manifest.json"
     s3.put_object(
         Bucket=ARTIFACTS_BUCKET,
         Key=key,
-        Body=response.content,
-        ContentType=response.headers.get("Content-Type"),
+        Body=json.dumps(manifest, indent=2, default=_json_default).encode("utf-8"),
+        ContentType="application/json",
     )
 
-    return SourceRef(ARTIFACTS_BUCKET, key)
+    return manifest, key
+
+
+def _stage_http_source(
+    job_id: str,
+    artifact_prefix: str,
+    download: HttpDownload,
+) -> HttpStagingResult:
+    original_ext = _infer_original_extension(download.filename, download.content_type) or ".bin"
+    normalized_bytes, fmt, schema_sample, row_count, normalized_ext, normalized_content_type = _normalise_http_download(
+        download
+    )
+
+    original_key = f"{artifact_prefix}/staged/original{original_ext}"
+    normalized_key = f"{artifact_prefix}/staged/normalized{normalized_ext}"
+
+    original_content_type = (
+        download.content_type or _content_type_for_extension(original_ext) or "application/octet-stream"
+    )
+    s3.put_object(
+        Bucket=ARTIFACTS_BUCKET,
+        Key=original_key,
+        Body=download.content,
+        ContentType=original_content_type,
+    )
+    s3.put_object(
+        Bucket=ARTIFACTS_BUCKET,
+        Key=normalized_key,
+        Body=normalized_bytes,
+        ContentType=normalized_content_type,
+    )
+
+    original_artifact = StagedArtifact(
+        bucket=ARTIFACTS_BUCKET,
+        key=original_key,
+        size=len(download.content),
+        content_type=original_content_type,
+    )
+    normalized_artifact = StagedArtifact(
+        bucket=ARTIFACTS_BUCKET,
+        key=normalized_key,
+        size=len(normalized_bytes),
+        content_type=normalized_content_type,
+    )
+
+    manifest, manifest_key = _build_http_manifest(
+        job_id,
+        artifact_prefix,
+        download,
+        original_artifact,
+        normalized_artifact,
+        fmt=fmt,
+        schema_sample=schema_sample,
+        row_count=row_count,
+    )
+
+    return HttpStagingResult(
+        original=original_artifact,
+        normalized=normalized_artifact,
+        manifest=manifest,
+        manifest_key=manifest_key,
+        format=fmt,
+        schema_sample=list(schema_sample),
+        row_count=row_count,
+    )
 
 
 def _json_default(value):
@@ -364,7 +729,7 @@ def _extract_sql_source(
     return SourceRef(ARTIFACTS_BUCKET, key)
 
 
-def _resolve_source(job_id: str, artifact_prefix: str, item: Dict[str, Dict]) -> Tuple[SourceRef, str]:
+def _resolve_source(job_id: str, artifact_prefix: str, item: Dict[str, Dict]) -> Tuple[object, str]:
     source = item.get("source") or {}
     source_type = source.get("type")
 
@@ -386,8 +751,7 @@ def _resolve_source(job_id: str, artifact_prefix: str, item: Dict[str, Dict]) ->
         return SourceRef(parts[0], parts[1]), source_type
 
     if source_type == "http":
-        protocol = source.get("protocol") or "http"
-        return _download_http_source(job_id, artifact_prefix, source), protocol
+        return _download_http_source(job_id, artifact_prefix, source), "http"
 
     if source_type == "database":
         ref = _extract_sql_source(job_id, artifact_prefix, source, default_name="database-export.csv")
@@ -502,7 +866,12 @@ def handler(event, _context):
         raise ValueError(f"Job {job_id} not found")
 
     artifact_prefix = _job_artifact_prefix(item, job_id)
-    src, source_type = _resolve_source(job_id, artifact_prefix, item)
+    try:
+        src, source_type = _resolve_source(job_id, artifact_prefix, item)
+    except Exception as exc:
+        print(f"[Stage] ERROR resolving source: {exc}")
+        _ddb_update(job_id, STATUS_FAILED, error=str(exc))
+        raise
 
     # Mark job as staging (idempotent)
     _ddb_update(job_id, STATUS_STAGING)
@@ -511,7 +880,14 @@ def handler(event, _context):
         _wait_for_upload(src)
 
     try:
-        staged = _stage_source(job_id, artifact_prefix, src)
+        if source_type == "http":
+            if not isinstance(src, HttpDownload):
+                raise ValueError("HTTP source resolution failed")
+            http_result = _stage_http_source(job_id, artifact_prefix, src)
+            staged = http_result.normalized
+        else:
+            http_result = None
+            staged = _stage_source(job_id, artifact_prefix, src)
     except FileNotReadyError:
         # Should never reach here due to early check, but propagate just in case.
         raise
@@ -519,6 +895,40 @@ def handler(event, _context):
         print(f"[Stage] ERROR copying object: {exc}")
         _ddb_update(job_id, STATUS_FAILED, error=str(exc))
         raise
+
+    if source_type == "http" and http_result is not None:
+        metadata = {
+            "size": staged.size,
+            "format": http_result.format,
+            "contentType": staged.content_type,
+            "sourceType": source_type,
+            "schemaSample": http_result.schema_sample,
+            "rowCountEstimate": http_result.row_count,
+            "originalKey": http_result.original.key,
+            "normalizedKey": http_result.normalized.key,
+            "manifestKey": http_result.manifest_key,
+        }
+
+        _ddb_update(
+            job_id,
+            STATUS_STAGED,
+            inputKey=staged.key,
+            inputMetadata=metadata,
+            manifestKey=http_result.manifest_key,
+        )
+
+        print(
+            f"[Stage] Staged HTTP data at {staged.path} (format={http_result.format}, size={staged.size}, rows={http_result.row_count})"
+        )
+
+        return {
+            "jobId": job_id,
+            "input": {"bucket": staged.bucket, "key": staged.key},
+            "metadata": metadata,
+            "artifactPrefix": artifact_prefix,
+            "manifest": http_result.manifest,
+            "manifestKey": http_result.manifest_key,
+        }
 
     fmt = _detect_format(staged.key, staged.content_type)
 

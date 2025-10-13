@@ -51,6 +51,19 @@ def stage_lambda(monkeypatch):
     module.secretsmanager = fake_secrets
     module.ssm = fake_ssm
 
+    def fake_public_getaddrinfo(host, port, *args, **kwargs):
+        return [
+            (
+                module.socket.AF_INET,
+                None,
+                None,
+                None,
+                ("93.184.216.34", port or 0),
+            )
+        ]
+
+    monkeypatch.setattr(module.socket, "getaddrinfo", fake_public_getaddrinfo)
+
     return module, fake_s3, fake_table, fake_secrets, fake_ssm
 
 
@@ -172,14 +185,29 @@ def test_stage_lambda_http_connector(stage_lambda, monkeypatch):
     payload = b"id,value\n1,99\n"
 
     class DummyResponse:
-        status_code = 200
-        headers = {"Content-Type": "text/csv", "Content-Disposition": "attachment; filename=data.csv"}
-        content = payload
+        def __init__(self, body: bytes):
+            self.status_code = 200
+            self._body = body
+            self.headers = {
+                "Content-Type": "text/csv",
+                "Content-Disposition": "attachment; filename=data.csv",
+                "Content-Length": str(len(body)),
+            }
 
-    def fake_request(method, url, headers=None, data=None, timeout=None):  # noqa: D401 - simple stub
+        def iter_content(self, chunk_size=8192):
+            for index in range(0, len(self._body), chunk_size):
+                yield self._body[index : index + chunk_size]
+
+        def close(self):
+            pass
+
+    def fake_request(method, url, headers=None, data=None, timeout=None, **kwargs):  # noqa: D401 - simple stub
         assert method == "GET"
         assert url == "https://example.com/data.csv"
-        return DummyResponse()
+        assert timeout == (5.0, 20.0)
+        assert kwargs.get("stream") is True
+        assert kwargs.get("allow_redirects") is False
+        return DummyResponse(payload)
 
     fake_table.put_item(
         {
@@ -194,11 +222,122 @@ def test_stage_lambda_http_connector(stage_lambda, monkeypatch):
 
     result = module.handler({"jobId": job_id}, None)
 
-    expected_key = f"artifacts/{job_id}/input/data.csv"
-    obj = fake_s3.get_object(Bucket=module.ARTIFACTS_BUCKET, Key=expected_key)
-    assert obj["Body"].read() == payload
+    expected_normalized = f"artifacts/{job_id}/staged/normalized.csv"
+    expected_original = f"artifacts/{job_id}/staged/original.csv"
 
-    assert result["metadata"]["sourceType"] == "https"
+    normalized = fake_s3.get_object(Bucket=module.ARTIFACTS_BUCKET, Key=expected_normalized)
+    assert normalized["Body"].read() == payload
+
+    original = fake_s3.get_object(Bucket=module.ARTIFACTS_BUCKET, Key=expected_original)
+    assert original["Body"].read() == payload
+
+    manifest_key = f"artifacts/{job_id}/manifest.json"
+    manifest_obj = fake_s3.get_object(Bucket=module.ARTIFACTS_BUCKET, Key=manifest_key)
+    manifest = json.loads(manifest_obj["Body"].read().decode("utf-8"))
+
+    assert manifest["format"] == "csv"
+    assert manifest["source"] == {"type": "http", "url": "https://example.com/data.csv"}
+    assert manifest["schemaSample"] == ["id", "value"]
+    assert manifest["rowCountEstimate"] == 1
+
+    assert result["input"]["key"] == expected_normalized
+    assert result["metadata"]["sourceType"] == "http"
+    assert result["metadata"]["manifestKey"] == manifest_key
+    assert result["metadata"]["schemaSample"] == ["id", "value"]
+    assert result["metadata"]["rowCountEstimate"] == 1
+
+    record = fake_table.get_item({"pk": f"job#{job_id}", "sk": "meta"}).get("Item")
+    assert record is not None
+    assert record["inputKey"] == expected_normalized
+    assert record["manifestKey"] == manifest_key
+    assert record["inputMetadata"]["schemaSample"] == ["id", "value"]
+
+
+def test_stage_lambda_http_blocks_private_host(stage_lambda, monkeypatch):
+    module, _, fake_table, _, _ = stage_lambda
+    job_id = "job-http-private"
+
+    fake_table.put_item(
+        {
+            "pk": f"job#{job_id}",
+            "sk": "meta",
+            "status": "QUEUED",
+            "source": {"type": "http", "url": "https://metadata.internal/latest"},
+        }
+    )
+
+    def fake_private_getaddrinfo(host, port, *args, **kwargs):
+        return [
+            (
+                module.socket.AF_INET,
+                None,
+                None,
+                None,
+                ("169.254.169.254", port or 0),
+            )
+        ]
+
+    monkeypatch.setattr(module.socket, "getaddrinfo", fake_private_getaddrinfo)
+
+    with pytest.raises(ValueError) as excinfo:
+        module.handler({"jobId": job_id}, None)
+
+    assert "private" in str(excinfo.value).lower()
+
+    record = fake_table.get_item({"pk": f"job#{job_id}", "sk": "meta"}).get("Item")
+    assert record is not None
+    assert record["status"] == module.STATUS_FAILED
+    assert "private" in record.get("error", "").lower()
+
+
+def test_stage_lambda_http_enforces_max_size(stage_lambda, monkeypatch):
+    module, _, fake_table, _, _ = stage_lambda
+    module.MAX_HTTP_BYTES = 8
+    job_id = "job-http-large"
+    payload = b"0123456789"
+
+    class DummyResponse:
+        def __init__(self, body: bytes):
+            self.status_code = 200
+            self._body = body
+            self.headers = {
+                "Content-Type": "text/csv",
+                "Content-Disposition": "attachment; filename=data.csv",
+                "Content-Length": str(len(body)),
+            }
+
+        def iter_content(self, chunk_size=8192):
+            for index in range(0, len(self._body), chunk_size):
+                yield self._body[index : index + chunk_size]
+
+        def close(self):
+            pass
+
+    def fake_request(method, url, headers=None, data=None, timeout=None, **kwargs):
+        assert kwargs.get("stream") is True
+        assert kwargs.get("allow_redirects") is False
+        return DummyResponse(payload)
+
+    fake_table.put_item(
+        {
+            "pk": f"job#{job_id}",
+            "sk": "meta",
+            "status": "QUEUED",
+            "source": {"type": "http", "url": "https://example.com/data.csv"},
+        }
+    )
+
+    monkeypatch.setattr(module.requests, "request", fake_request)
+
+    with pytest.raises(ValueError) as excinfo:
+        module.handler({"jobId": job_id}, None)
+
+    assert "max_http_bytes" in str(excinfo.value).lower()
+
+    record = fake_table.get_item({"pk": f"job#{job_id}", "sk": "meta"}).get("Item")
+    assert record is not None
+    assert record["status"] == module.STATUS_FAILED
+    assert "max_http_bytes" in record.get("error", "").lower()
 
 
 def test_stage_lambda_sqlite_connector(stage_lambda, tmp_path):
