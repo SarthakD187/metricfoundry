@@ -44,14 +44,18 @@ def finalize_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
         }
 
     artifact_prefix_raw = state.get("artifact_prefix")
+    job_identifier = state.get("job_id") or state.get("jobId")
+
     if isinstance(artifact_prefix_raw, str) and artifact_prefix_raw.strip():
-        artifact_prefix = artifact_prefix_raw
+        artifact_prefix = artifact_prefix_raw.strip()
     else:
-        job_id = state.get("job_id")
-        if isinstance(job_id, str) and job_id.strip():
-            artifact_prefix = f"artifacts/{job_id.strip()}"
+        if isinstance(job_identifier, str) and job_identifier.strip():
+            artifact_prefix = f"artifacts/{job_identifier.strip()}"
         else:
             artifact_prefix = "artifacts"
+
+    if artifact_prefix.strip() == "artifacts" and isinstance(job_identifier, str) and job_identifier.strip():
+        artifact_prefix = f"artifacts/{job_identifier.strip()}"
     existing_artifacts: Dict[str, Dict[str, Any]] = dict(state.get("artifact_contents", {}))
     bundle_artifacts = _build_curated_bundles(phases, existing_artifacts)
     artifact_contents = dict(existing_artifacts)
