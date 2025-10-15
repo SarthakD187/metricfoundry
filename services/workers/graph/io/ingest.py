@@ -1,5 +1,5 @@
 from __future__ import annotations
-import io, json, csv, gzip, zipfile, tarfile, sqlite3, contextlib, tempfile, mimetypes, base64, codecs
+import io, json, csv, gzip, zipfile, tarfile, sqlite3, contextlib, tempfile, mimetypes, base64, codecs, os
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, Union, IO, Set, MutableMapping, cast
 from ..core.types import DatasetSummary, ColumnAccumulator, RunningStats, BinaryInput
 from ..core.utils import _open_binary_stream, _ensure_bytes, _open_archive_stream, _format_preview

@@ -29,6 +29,9 @@ permissions:
   id-token: write
   pull-requests: write
 
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+
 jobs:
   quality:
     name: Lint, test, and synth
@@ -147,7 +150,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Install dependencies
         run: |

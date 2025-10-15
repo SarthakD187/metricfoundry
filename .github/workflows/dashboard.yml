@@ -16,6 +16,9 @@ permissions:
   contents: read
   id-token: write
 
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+
 jobs:
   build:
     name: Build dashboard
@@ -109,7 +112,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Download static artifact
         uses: actions/download-artifact@v4
