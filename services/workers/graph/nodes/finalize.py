@@ -43,7 +43,15 @@ def finalize_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
             "message": "Automated modeling did not execute for this dataset.",
         }
 
-    artifact_prefix: str = state.get("artifact_prefix", "artifacts")
+    artifact_prefix_raw = state.get("artifact_prefix")
+    if isinstance(artifact_prefix_raw, str) and artifact_prefix_raw.strip():
+        artifact_prefix = artifact_prefix_raw
+    else:
+        job_id = state.get("job_id")
+        if isinstance(job_id, str) and job_id.strip():
+            artifact_prefix = f"artifacts/{job_id.strip()}"
+        else:
+            artifact_prefix = "artifacts"
     existing_artifacts: Dict[str, Dict[str, Any]] = dict(state.get("artifact_contents", {}))
     bundle_artifacts = _build_curated_bundles(phases, existing_artifacts)
     artifact_contents = dict(existing_artifacts)
