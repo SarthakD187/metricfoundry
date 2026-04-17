@@ -7,7 +7,7 @@ from .app import (
 )
 from .core.constants import PHASE_ORDER, _ARCHIVE_STREAM_CHUNK_SIZE
 from .core.types import PipelineResult
-from .io.ingest import ingest_dataset
+from .io.ingest import ingest_dataset, _ingest_csv, _ingest_parquet
 
 __all__ = [
     "run_pipeline",
@@ -19,4 +19,6 @@ __all__ = [
     "_ARCHIVE_STREAM_CHUNK_SIZE",
     "PipelineResult",
     "ingest_dataset",
+    "_ingest_csv",
+    "_ingest_parquet",
 ]

@@ -4,6 +4,7 @@ import os
 import time
 import sqlite3
 import base64
+import logging
 from typing import Any, Dict, Mapping, Optional, Callable
 from collections.abc import Mapping as MappingABC, Sequence
 
@@ -26,11 +27,13 @@ from .nodes import (
 )
 from .core.constants import PHASE_ORDER
 from .core.types import PipelineResult, BinaryInput
-from .core.state import _with_phase  # only if you need it in handlers
 
 
 _ddb_resource = None
 _s3_client = None
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 _DEFAULT_MAX_BODY_BYTES = 512 * 1024 * 1024  # 512 MB safety guardrail
 _STREAM_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB chunks keep memory bounded
@@ -174,7 +177,7 @@ def _ddb_upsert_status(table_name: str, job_id: str, status: str, **attrs: Any) 
             ExpressionAttributeValues=expr_vals,
         )
     except (BotoCoreError, ClientError) as exc:
-        print(f"[LangGraphWorker] Warning: failed to upsert status for {job_id}: {exc}")
+        logger.warning("failed to upsert status for %s: %s", job_id, exc)
 
 
 def _callback_from_event(event: Mapping[str, Any]) -> PhaseCallback:
@@ -212,14 +215,14 @@ def _callback_from_event(event: Mapping[str, Any]) -> PhaseCallback:
                     progress=progress,
                     phaseSummary=summary,
                 )
-            except Exception as exc:  # pragma: no cover - defensive
-                print(f"[LangGraphWorker] Warning: callback update failed for {phase}: {exc}")
+            except (BotoCoreError, ClientError) as exc:  # pragma: no cover
+                logger.warning("callback update failed for %s: %s", phase, exc)
 
         return _callback
 
     if mode == "log":
         def _log_callback(phase: str, _payload: Mapping[str, Any], index: int, total: int) -> None:
-            print(f"[LangGraphWorker] Phase {index + 1}/{total}: {phase}")
+            logger.info("phase %s/%s: %s", index + 1, total, phase)
 
         return _log_callback
 
@@ -347,7 +350,7 @@ def run_pipeline(
                 checkpointer = None
 
         if checkpointer is None:
-            db_path = os.environ.get("CHECKPOINT_SQLITE_PATH", "graph.ckpt.sqlite")
+            db_path = os.environ.get("CHECKPOINT_SQLITE_PATH", ":memory:")
             use_uri = db_path.startswith("file:")
             if not use_uri:
                 try:

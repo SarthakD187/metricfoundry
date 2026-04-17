@@ -1,16 +1,19 @@
 from __future__ import annotations
-import io, json, zipfile, mimetypes
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional
-from ..core.state import _with_phase, _emit_callback
-from ..core.constants import PHASE_ORDER
+import base64
 import csv
 import io
 import json
-import base64
-from typing import Any, Mapping
+import mimetypes
+import zipfile
+from typing import Any, Dict, List, Mapping, MutableMapping
+
+from ..core.state import _with_phase, _emit_callback
+from ..core.constants import PHASE_ORDER
+from ..core.types import DatasetSummary
 
 
 def finalize_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
+    """Assemble final metrics, manifest entries, and artifact bundles."""
     dataset: DatasetSummary = state["dataset"]
     phases: Dict[str, Dict[str, Any]] = state.get("phase_outputs", {})
     dq = phases.get("dq_validate", {})
@@ -117,7 +120,7 @@ def finalize_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
     _emit_callback(state, "finalize", payload)
     return update
 
-def _artifact_bytes_for_bundle(spec: dict) -> bytes:
+def _artifact_bytes_for_bundle(spec: Mapping[str, Any]) -> bytes:
     """
     Build bytes for a bundle specification.
 
@@ -181,7 +184,7 @@ def _artifact_bytes_for_bundle(spec: dict) -> bytes:
     return json.dumps(spec, ensure_ascii=False, default=_json_default).encode("utf-8")
 
 
-def _json_default(o: Any):
+def _json_default(o: Any) -> Mapping[str, Any]:
     """JSON fallback: encode bytes as base64 so dumps never crashes."""
     if isinstance(o, (bytes, bytearray, memoryview)):
         return {"__b64__": True, "data": base64.b64encode(bytes(o)).decode("ascii")}

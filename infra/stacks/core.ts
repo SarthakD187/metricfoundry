@@ -68,6 +68,7 @@ export class MetricFoundryCoreStack extends Stack {
 
     this.artifacts = new s3.Bucket(this, "Artifacts", {
       versioned: true,
+      encryption: s3.BucketEncryption.S3_MANAGED,
       enforceSSL: true,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       cors: [
@@ -112,8 +113,7 @@ export class MetricFoundryCoreStack extends Stack {
     const stageCodePath = path.join(__dirname, "../../lambdas/stage");
     const stageFn = new lambda.Function(this, "StageSourceFn", {
       runtime: lambda.Runtime.PYTHON_3_11,
-      // Ensure your file is lambdas/stage/handler.py with def lambda_handler(event, context)
-      handler: "handler.lambda_handler",
+      handler: "handler.handler",
       code: lambda.Code.fromAsset(stageCodePath, {
         bundling: pyLocalBundling(stageCodePath),
       }),
@@ -143,12 +143,12 @@ export class MetricFoundryCoreStack extends Stack {
     const statusCodePath = path.join(__dirname, "../../lambdas/status");
     const statusFn = new lambda.Function(this, "StatusFn", {
       runtime: lambda.Runtime.PYTHON_3_11,
-      handler: "handler.lambda_handler",
+      handler: "handler.handler",
       code: lambda.Code.fromAsset(statusCodePath, {
         bundling: pyLocalBundling(statusCodePath),
       }),
       timeout: Duration.seconds(30),
-      memorySize: 256,
+      memorySize: 512,
       environment: {
         JOBS_TABLE: this.jobsTable.tableName,
         TABLE_NAME: this.jobsTable.tableName,

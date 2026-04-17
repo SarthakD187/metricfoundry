@@ -62,6 +62,12 @@ def _assert_pipeline_result(res):
 def env_guard():
     """Save/restore env so tests don't leak env vars."""
     before = dict(os.environ)
+    default_ckpt = pathlib.Path("graph.ckpt.sqlite")
+    default_ckpt.unlink(missing_ok=True)
+
+    env_ckpt = os.environ.get("CHECKPOINT_SQLITE_PATH")
+    if env_ckpt:
+        pathlib.Path(env_ckpt).unlink(missing_ok=True)
     try:
         yield
     finally:
@@ -73,6 +79,11 @@ def env_guard():
         # Restore original values
         for k, v in before.items():
             os.environ[k] = v
+
+        default_ckpt.unlink(missing_ok=True)
+        env_ckpt_after = os.environ.get("CHECKPOINT_SQLITE_PATH")
+        if env_ckpt_after:
+            pathlib.Path(env_ckpt_after).unlink(missing_ok=True)
 
 
 def test_pipeline_no_checkpoint(env_guard, tmp_path):

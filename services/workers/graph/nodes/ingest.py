@@ -1,11 +1,12 @@
 from __future__ import annotations
-from typing import Any, Dict, MutableMapping, Optional
+from typing import Any, Dict, MutableMapping
 
 from ..core.state import _with_phase, _emit_callback
 from ..io.ingest import ingest_dataset
 from ..core.types import BinaryInput
 
 def ingest_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
+    """Ingest raw job input into a normalized `DatasetSummary`."""
     source = state.get("source", {}) or {}
     key = source.get("key", "dataset.csv")
 

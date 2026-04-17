@@ -1,12 +1,14 @@
 import base64
 import json
+import logging
 import os
 import time
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
 from services.common.pipeline import (
     build_results_payload,
@@ -27,6 +29,9 @@ from services.workers.graph.graph import (
 s3 = boto3.client("s3")
 ddb = boto3.resource("dynamodb")
 lambda_client = boto3.client("lambda")
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 TABLE_NAME = os.environ["JOBS_TABLE"]
 ARTIFACTS_BUCKET = os.environ.get("ARTIFACTS_BUCKET")
@@ -67,7 +72,7 @@ def ddb_upsert_status(job_id: str, status: str, **attrs) -> None:
     )
 
 
-def _default_callback(job_id: str):
+def _default_callback(job_id: str) -> Callable[[str, Mapping[str, Any], int, int], None]:
     def _callback(phase: str, payload: Mapping[str, Any], index: int, total: int) -> None:
         progress = int(((index + 1) / total) * 100)
         try:
@@ -80,8 +85,8 @@ def _default_callback(job_id: str):
                 progress=progress,
                 phaseSummary=summarize_phase_payload(payload),
             )
-        except Exception as exc:  # pragma: no cover - DynamoDB errors shouldn't halt job
-            print(f"[ProcessorFn] Warning: failed to stream phase status for {phase}: {exc}")
+        except (BotoCoreError, ClientError) as exc:  # pragma: no cover
+            logger.warning("failed to stream phase status for %s: %s", phase, exc)
 
     return _callback
 
@@ -171,7 +176,7 @@ def _invoke_worker_lambda(
         body_bytes=body_bytes,
         body_s3=body_s3,
     )
-    print(f"[ProcessorFn] Invoking LangGraph worker Lambda for job {job_id}")
+    logger.info("invoking LangGraph worker Lambda for job %s", job_id)
     response = lambda_client.invoke(
         FunctionName=WORKER_ARN,
         InvocationType="RequestResponse",
@@ -189,7 +194,7 @@ def _invoke_worker_lambda(
         if callable(closer):
             try:
                 closer()
-            except Exception:
+            except (BotoCoreError, ClientError, OSError):
                 pass
 
     if "FunctionError" in response:
@@ -247,7 +252,7 @@ def _invoke_worker_http(
         headers=headers,
         method="POST",
     )
-    print(f"[ProcessorFn] Invoking LangGraph worker HTTP endpoint for job {job_id}")
+    logger.info("invoking LangGraph worker HTTP endpoint for job %s", job_id)
     try:
         with urllib_request.urlopen(request, timeout=900) as response:
             raw = response.read()
@@ -307,13 +312,17 @@ def _log_phase_progress(job_id: str, phases: Mapping[str, Any]) -> None:
     ordered = [phase for phase in PHASE_ORDER if phase in phases]
     total = len(ordered) or len(PHASE_ORDER)
     for index, phase in enumerate(ordered):
-        print(
-            f"[ProcessorFn] Phase {phase} completed for job {job_id} "
-            f"({index + 1}/{total})"
+        logger.info(
+            "phase %s completed for job %s (%s/%s)",
+            phase,
+            job_id,
+            index + 1,
+            total,
         )
 
 
-def main(event, _ctx):
+def main(event: Mapping[str, Any], _ctx: Any) -> Dict[str, Any]:
+    """Run analytics pipeline for a staged object and persist outputs."""
     job_id = event.get("jobId")
     payload_input = event.get("input") or {}
     bucket = payload_input.get("bucket")
@@ -322,12 +331,12 @@ def main(event, _ctx):
     if not job_id or not bucket or not key:
         raise ValueError("jobId, input.bucket, and input.key are required")
 
-    print(f"[ProcessorFn] Processing job {job_id} using s3://{bucket}/{key}")
+    logger.info("processing job %s using s3://%s/%s", job_id, bucket, key)
 
     try:
         ddb_upsert_status(job_id, STATUS_RUNNING, inputKey=key, currentPhase=PHASE_ORDER[0], progress=0)
-    except Exception as e:
-        print(f"[ProcessorFn] Warning: failed to upsert initial RUNNING status: {e}")
+    except (BotoCoreError, ClientError) as exc:
+        logger.warning("failed to upsert initial RUNNING status for %s: %s", job_id, exc)
 
     artifact_prefix_raw = event.get("artifactPrefix") or event.get("artifact_prefix")
     artifact_prefix = (artifact_prefix_raw or f"artifacts/{job_id}").rstrip("/")
@@ -335,12 +344,14 @@ def main(event, _ctx):
 
     try:
         if ARTIFACTS_BUCKET and object_exists(s3, ARTIFACTS_BUCKET, results_key):
-            print(
-                f"[ProcessorFn] Results already exist at s3://{ARTIFACTS_BUCKET}/{results_key} (idempotent skip)."
+            logger.info(
+                "results already exist at s3://%s/%s (idempotent skip)",
+                ARTIFACTS_BUCKET,
+                results_key,
             )
             return {"ok": True, "jobId": job_id, "resultKey": results_key, "idempotent": True}
-    except Exception as e:
-        print(f"[ProcessorFn] Warning: head_object failed for existing results check: {e}")
+    except (BotoCoreError, ClientError) as exc:
+        logger.warning("head_object failed for existing results check: %s", exc)
 
     try:
         source_descriptor = {"bucket": bucket, "key": key}
@@ -369,7 +380,7 @@ def main(event, _ctx):
                 if callable(closer):
                     try:
                         closer()
-                    except Exception:
+                    except (BotoCoreError, ClientError, OSError):
                         pass
 
         if not _is_embedded_mode():
@@ -401,7 +412,7 @@ def main(event, _ctx):
                 s3_client=s3,
                 artifact_prefix=artifact_prefix,
             )
-        except Exception:
+        except (BotoCoreError, ClientError):
             pass
 
         s3.put_object(
@@ -419,20 +430,20 @@ def main(event, _ctx):
                 manifestKey=artifact_keys.get("manifest"),
                 completedAt=now_epoch(),
             )
-        except Exception as e:
-            print(f"[ProcessorFn] Warning: failed to upsert SUCCEEDED status: {e}")
+        except (BotoCoreError, ClientError) as exc:
+            logger.warning("failed to upsert SUCCEEDED status: %s", exc)
 
-        print(f"[ProcessorFn] Wrote results to s3://{target_bucket}/{results_key}")
+        logger.info("wrote results to s3://%s/%s", target_bucket, results_key)
         return {"ok": True, "jobId": job_id, "resultKey": results_key, "manifestKey": artifact_keys.get("manifest")}
 
-    except Exception as e:
+    except (ValueError, TypeError, RuntimeError, BotoCoreError, ClientError, urllib_error.URLError) as e:
         err_txt = f"{type(e).__name__}: {e}"
-        print(f"[ProcessorFn] ERROR: {err_txt}")
+        logger.error("processing error: %s", err_txt)
 
         try:
             ddb_upsert_status(job_id, STATUS_FAILED, error=err_txt[:1000])
-        except Exception as e2:
-            print(f"[ProcessorFn] Warning: failed to upsert FAILED status: {e2}")
+        except (BotoCoreError, ClientError) as exc:
+            logger.warning("failed to upsert FAILED status: %s", exc)
 
         try:
             target_bucket = ARTIFACTS_BUCKET or bucket
@@ -443,7 +454,22 @@ def main(event, _ctx):
                 Body=json.dumps({"jobId": job_id, "error": err_txt}, indent=2).encode("utf-8"),
                 ContentType="application/json",
             )
-        except Exception as e3:
-            print(f"[ProcessorFn] Warning: failed to write error artifact: {e3}")
+        except (BotoCoreError, ClientError) as exc:
+            logger.warning("failed to write error artifact: %s", exc)
 
         raise
+
+
+def lambda_handler(event: Mapping[str, Any], context: Any) -> Dict[str, Any]:
+    """API-shaped wrapper for direct Lambda invocation."""
+    try:
+        return {"statusCode": 200, "body": main(event, context)}
+    except ValueError as exc:
+        return {"statusCode": 400, "body": {"error": str(exc)}}
+    except (BotoCoreError, ClientError, RuntimeError, urllib_error.URLError):
+        return {"statusCode": 502, "body": {"error": "Failed to process staged input"}}
+
+
+def handler(event: Mapping[str, Any], context: Any) -> Dict[str, Any]:
+    """Primary Lambda entrypoint used by Step Functions."""
+    return main(event, context)

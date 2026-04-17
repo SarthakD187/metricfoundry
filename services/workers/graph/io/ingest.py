@@ -1,5 +1,5 @@
 from __future__ import annotations
-import io, json, csv, gzip, zipfile, tarfile, sqlite3, contextlib, tempfile, mimetypes, base64, codecs
+import io, json, csv, gzip, zipfile, tarfile, sqlite3, contextlib, tempfile, mimetypes, base64, codecs, os
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, Union, IO, Set, MutableMapping, cast
 from ..core.types import DatasetSummary, ColumnAccumulator, RunningStats, BinaryInput
 from ..core.utils import _open_binary_stream, _ensure_bytes, _open_archive_stream, _format_preview
@@ -313,6 +313,18 @@ def _ingest_parquet(body: bytes) -> DatasetSummary:
     return _dataframe_to_dataset(frame, "parquet", len(body))
 
 
+def _resolve_parquet_ingestor():
+    """Allow tests to monkeypatch graph._ingest_parquet and have it take effect."""
+    try:
+        from .. import graph as graph_module  # local import avoids circular import at module load
+    except Exception:  # pragma: no cover - defensive fallback
+        return _ingest_parquet
+    candidate = getattr(graph_module, "_ingest_parquet", None)
+    if callable(candidate):
+        return candidate
+    return _ingest_parquet
+
+
 def _normalize_database_value(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return base64.b64encode(bytes(value)).decode("ascii")
@@ -454,7 +466,8 @@ def ingest_dataset(key: str, body: BinaryInput) -> DatasetSummary:
             if should_close:
                 stream.close()
     if lowered.endswith(".parquet") or lowered.endswith(".pq") or lowered.endswith(".pqt") or lowered.endswith(".parq"):
-        return _ingest_parquet(_ensure_bytes(body))
+        parquet_ingestor = _resolve_parquet_ingestor()
+        return parquet_ingestor(_ensure_bytes(body))
     if lowered.endswith(".xlsx") or lowered.endswith(".xls") or lowered.endswith(".xlsm"):
         return _ingest_excel(_ensure_bytes(body))
     if lowered.endswith(".sqlite") or lowered.endswith(".sqlite3") or lowered.endswith(".db"):
@@ -466,4 +479,3 @@ def ingest_dataset(key: str, body: BinaryInput) -> DatasetSummary:
     if lowered.endswith(".json"):
         return _ingest_json(_ensure_bytes(body))
     return _ingest_csv(key, body)
-

@@ -1,6 +1,5 @@
 from __future__ import annotations
 from typing import Any, Dict, List, MutableMapping, Optional
-from ..core.types import DatasetSummary
 from ..core.state import _with_phase, _emit_callback
 from ..core.constants import (
     _DQ_SEVERITY_WEIGHTS, _NUMERIC_RANGE_ERROR_RATIO, _NUMERIC_RANGE_WARNING_RATIO,
@@ -8,11 +7,7 @@ from ..core.constants import (
 )
 
 def dq_validate_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
-    dataset: DatasetSummary | None = state.get("dataset")
-    if dataset is None:
-        raise ValueError("dq_validate requires 'dataset' in state. Upstream parse/profile must set state['dataset'].")
-
-def dq_validate_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
+    """Run lightweight data-quality checks and attach issue metadata."""
     dataset = state.get("dataset")
     if dataset is None:
         raise ValueError(

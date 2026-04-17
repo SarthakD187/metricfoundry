@@ -11,13 +11,14 @@ import csv
 import io
 import ipaddress
 import json
+import logging
 import os
 import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import import_module
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import boto3
@@ -31,6 +32,9 @@ s3 = boto3.client("s3")
 ddb = boto3.resource("dynamodb")
 secretsmanager = boto3.client("secretsmanager")
 ssm = boto3.client("ssm")
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 TABLE_NAME = os.environ["JOBS_TABLE"]
 ARTIFACTS_BUCKET = os.environ["ARTIFACTS_BUCKET"]
@@ -239,7 +243,7 @@ def _validate_http_url(url: str) -> str:
     return url
 
 
-def _coerce_timeout(value) -> Tuple[float, float]:
+def _coerce_timeout(value: Any) -> Tuple[float, float]:
     if value is None:
         return (5.0, 20.0)
 
@@ -561,7 +565,7 @@ def _stage_http_source(
     )
 
 
-def _json_default(value):
+def _json_default(value: Any) -> str:
     if isinstance(value, (bytes, bytearray)):
         return value.decode("utf-8", errors="ignore")
     return str(value)
@@ -852,12 +856,13 @@ def _stage_source(job_id: str, artifact_prefix: str, src: SourceRef) -> StagedAr
     )
 
 
-def handler(event, _context):
+def handler(event: Mapping[str, Any], _context: Any) -> Dict[str, Any]:
+    """Stage source input into the artifacts bucket and persist staging metadata."""
     job_id = event.get("jobId")
     if not job_id:
         raise ValueError("jobId is required")
 
-    print(f"[Stage] Starting staging for job {job_id}")
+    logger.info("starting staging for job %s", job_id)
 
     # Fetch job metadata
     res = _table().get_item(Key={"pk": f"job#{job_id}", "sk": "meta"})
@@ -868,8 +873,8 @@ def handler(event, _context):
     artifact_prefix = _job_artifact_prefix(item, job_id)
     try:
         src, source_type = _resolve_source(job_id, artifact_prefix, item)
-    except Exception as exc:
-        print(f"[Stage] ERROR resolving source: {exc}")
+    except (ValueError, ClientError, DBAPIError, NoSuchModuleError, requests.RequestException) as exc:
+        logger.error("failed resolving source for job %s: %s", job_id, exc)
         _ddb_update(job_id, STATUS_FAILED, error=str(exc))
         raise
 
@@ -891,8 +896,8 @@ def handler(event, _context):
     except FileNotReadyError:
         # Should never reach here due to early check, but propagate just in case.
         raise
-    except Exception as exc:
-        print(f"[Stage] ERROR copying object: {exc}")
+    except (ValueError, ClientError, DBAPIError, NoSuchModuleError, requests.RequestException) as exc:
+        logger.error("failed staging source object for job %s: %s", job_id, exc)
         _ddb_update(job_id, STATUS_FAILED, error=str(exc))
         raise
 
@@ -917,8 +922,12 @@ def handler(event, _context):
             manifestKey=http_result.manifest_key,
         )
 
-        print(
-            f"[Stage] Staged HTTP data at {staged.path} (format={http_result.format}, size={staged.size}, rows={http_result.row_count})"
+        logger.info(
+            "staged HTTP data at %s (format=%s size=%s rows=%s)",
+            staged.path,
+            http_result.format,
+            staged.size,
+            http_result.row_count,
         )
 
         return {
@@ -946,7 +955,7 @@ def handler(event, _context):
         inputMetadata=metadata,
     )
 
-    print(f"[Stage] Staged data at {staged.path} (format={fmt}, size={staged.size})")
+    logger.info("staged data at %s (format=%s size=%s)", staged.path, fmt, staged.size)
 
     return {
         "jobId": job_id,
@@ -954,3 +963,15 @@ def handler(event, _context):
         "metadata": metadata,
         "artifactPrefix": artifact_prefix,
     }
+
+
+def lambda_handler(event: Mapping[str, Any], context: Any) -> Dict[str, Any]:
+    """API-shaped wrapper for direct Lambda invocation."""
+    try:
+        return {"statusCode": 200, "body": handler(event, context)}
+    except FileNotReadyError as exc:
+        return {"statusCode": 409, "body": {"error": str(exc)}}
+    except ValueError as exc:
+        return {"statusCode": 400, "body": {"error": str(exc)}}
+    except (ClientError, DBAPIError, NoSuchModuleError, requests.RequestException):
+        return {"statusCode": 502, "body": {"error": "Failed to stage source data"}}

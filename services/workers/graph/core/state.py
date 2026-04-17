@@ -6,6 +6,9 @@ def _with_phase(state: MutableMapping[str, Any], phase: str, payload: Dict[str, 
     phases = dict(state.get("phase_outputs", {}))
     phases[phase] = payload
     update: Dict[str, Any] = {"phase_outputs": phases}
+    for key in ("job_id", "source", "artifact_prefix", "_callback"):
+        if key in state:
+            update[key] = state[key]
     update.update(extra)
     return update
 

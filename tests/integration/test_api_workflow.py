@@ -46,7 +46,7 @@ class FakeStepFunctions:
         execution = dict(kwargs)
         self.executions.append(execution)
         return {
-            "executionArn": f"arn:aws:states:us-east-1:123456789012:execution:stateMachine:{kwargs['name']}",
+            "executionArn": f"arn:aws:states:us-east-1:ACCOUNT_ID:execution:stateMachine:{kwargs['name']}",
             "startDate": datetime.now(timezone.utc),
         }
 

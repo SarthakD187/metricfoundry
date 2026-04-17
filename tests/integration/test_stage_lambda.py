@@ -418,7 +418,7 @@ def test_stage_lambda_database_secret(stage_lambda, tmp_path):
     conn.commit()
     conn.close()
 
-    secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:database"
+    secret_arn = "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:database"
     fake_secrets.put_secret(secret_arn, json.dumps({"url": f"sqlite:///{db_path}"}))
 
     fake_table.put_item(

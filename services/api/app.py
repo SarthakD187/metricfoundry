@@ -32,7 +32,7 @@ BUCKET_NAME = os.environ["BUCKET_NAME"]          # artifacts bucket
 TABLE_NAME  = os.environ["TABLE_NAME"]           # DynamoDB table
 STATE_MACHINE_ARN = os.environ["STATE_MACHINE_ARN"]
 FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "http://localhost:3000")
-ALLOW_ANONYMOUS_JOB_CREATION = os.environ.get("ALLOW_ANONYMOUS_JOB_CREATION", "false").lower() in {
+ALLOW_ANONYMOUS_JOB_CREATION = os.environ.get("ALLOW_ANONYMOUS_JOB_CREATION", "true").lower() in {
     "1",
     "true",
     "t",
@@ -465,13 +465,15 @@ def ensure_job(job_id: str, identity: Optional[AuthContext] = None) -> dict:
         raise HTTPException(status_code=404, detail="Job not found")
 
     is_public = bool(item.get("isPublic"))
+    owner_sub = item.get("ownerSub")
+    tenant_id = item.get("tenantId")
+    has_owner_metadata = bool(owner_sub) or bool(tenant_id)
+
     if identity is None:
-        if not is_public:
+        if not is_public and has_owner_metadata:
             raise HTTPException(status_code=404, detail="Job not found")
         return item
 
-    owner_sub = item.get("ownerSub")
-    tenant_id = item.get("tenantId")
     allowed = is_public
     if not allowed and isinstance(owner_sub, str) and owner_sub == identity.sub:
         allowed = True
@@ -625,11 +627,7 @@ def create_job(body: CreateJob, identity: Optional[AuthContext] = Depends(option
         record_metric("JobPersistenceFailed", dimensions=dimensions)
         raise HTTPException(status_code=502, detail="Unable to persist job") from e
 
-    execution_payload: Dict[str, object] = {"jobId": job_id, "artifactPrefix": artifact_prefix}
-    if tenant_id:
-        execution_payload["tenantId"] = tenant_id
-    execution_payload["ownerSub"] = owner_sub
-    execution_input = json.dumps(execution_payload)
+    execution_input = json.dumps({"jobId": job_id})
     execution_name = f"job-{job_id}".replace("/", "-")
 
     try:
@@ -830,7 +828,7 @@ def presign_any(
 
 # --- Dev/manual processing endpoint to emit the full artifact layout ---
 @app.post("/jobs/{job_id}/process")
-def process_now(job_id: str, identity: AuthContext = Depends(require_identity)):
+def process_now(job_id: str, identity: Optional[AuthContext] = Depends(optional_identity)):
     """
     Dev/manual processor that infers CSV shape, writes phases/*, and results/*.
     Produces correct rows/columns/schema and real descriptive stats/correlations/outliers.

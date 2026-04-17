@@ -1,9 +1,10 @@
 from __future__ import annotations
-from typing import Any, Dict, MutableMapping, List
+from typing import Any, Dict, MutableMapping
 from ..core.types import DatasetSummary
 from ..core.state import _with_phase, _emit_callback
 
 def profile_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
+    """Build per-column profile statistics from the ingested dataset."""
     dataset: DatasetSummary = state["dataset"]
     profiles = [dataset.column(name).to_profile(dataset.row_count) for name in dataset.column_names]
     completeness = 0.0

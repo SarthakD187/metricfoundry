@@ -1,10 +1,9 @@
 from __future__ import annotations
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence
 from ..core.types import DatasetSummary, ColumnAccumulator
 from ..core.state import _with_phase, _emit_callback
 from ..core.utils import _get_pyplot, _sanitize_filename
 from ..core.constants import _MAX_HISTOGRAMS, _MAX_SCATTERS, _MAX_BOX_PLOTS, _MAX_HEATMAP_COLUMNS
-from typing import Sequence
 import math
 import io
 import base64
@@ -13,6 +12,7 @@ matplotlib.use("Agg")  # safe headless backend
 from matplotlib import pyplot as plt
 
 def descriptive_stats_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
+    """Compute descriptive metrics and generate visualization artifacts."""
     dataset: DatasetSummary = state["dataset"]
     stats_rows: List[Dict[str, Any]] = []
     outliers: List[Dict[str, Any]] = []

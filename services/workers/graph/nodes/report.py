@@ -9,6 +9,7 @@ from ..core.utils import _JINJA_ENV
 logger = logging.getLogger(__name__)
 
 def nl_report_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
+    """Generate human-readable narrative report artifacts from phase outputs."""
     dataset: DatasetSummary = state["dataset"]
     phases = state.get("phase_outputs", {})
     dq = phases.get("dq_validate", {})

@@ -737,6 +737,7 @@ def _run_automl_training(dataset: DatasetSummary) -> _AutoMLArtifacts:
     )
 
 def ml_inference_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
+    """Train a best-effort model and attach prediction/model artifacts."""
     dataset: DatasetSummary = state["dataset"]
     artifact_contents = dict(state.get("artifact_contents", {}))
 

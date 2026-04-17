@@ -13,6 +13,20 @@ function formatNumber(n?: number) {
   return typeof n === "number" ? n.toLocaleString() : "—";
 }
 
+function artifactBaseForJob(jobId: string, data: ResultsJson): string {
+  const candidates = [data?.links?.resultsJson, data?.links?.resultsManifest, data?.links?.manifest];
+  for (const link of candidates) {
+    if (typeof link !== "string" || !link.startsWith("s3://")) continue;
+    const slash = link.indexOf("/", 5);
+    if (slash === -1) continue;
+    const key = link.slice(slash + 1);
+    const marker = "/results/";
+    const idx = key.indexOf(marker);
+    if (idx > 0) return key.slice(0, idx);
+  }
+  return `artifacts/${jobId}`;
+}
+
 // super-naive CSV preview: split by newline + comma
 async function fetchCsvPreview(url: string, maxRows = 25): Promise<{ columns: string[]; rows: string[][] }> {
   const r = await fetch(url);
@@ -46,13 +60,14 @@ export default function ResultsViewer({
   const [outliersUrl, setOutliersUrl] = useState<string | null>(null);
 
   const [descPreview, setDescPreview] = useState<{ columns: string[]; rows: string[][] } | null>(null);
+  const artifactBase = useMemo(() => artifactBaseForJob(jobId, data), [jobId, data]);
 
   // Load artifacts under phases/ and results/
   useEffect(() => {
     (async () => {
       // phases
       try {
-        const phases = await listArtifacts(jobId, `artifacts/${jobId}/phases/`);
+        const phases = await listArtifacts(jobId, `${artifactBase}/phases/`);
         setPhaseFiles((phases.objects || []).map((o) => o.key!).filter(Boolean));
       } catch { /* ignore */ }
 
@@ -61,16 +76,16 @@ export default function ResultsViewer({
         try { const r = await presign(jobId, key); setter(r.downloadUrl); } catch { /* ignore */ }
       };
 
-      await presignSafe(`artifacts/${jobId}/results/report.html`, (u) => setReportUrl(u));
-      await presignSafe(`artifacts/${jobId}/results/descriptive_stats.csv`, (u) => setDescCsvUrl(u));
-      await presignSafe(`artifacts/${jobId}/results/correlations.csv`, (u) => setCorrCsvUrl(u));
-      await presignSafe(`artifacts/${jobId}/results/outliers.json`, (u) => setOutliersUrl(u));
-      await presignSafe(`artifacts/${jobId}/results/bundles/analytics_bundle.zip`, (u) => setAnalyticsZip(u));
-      await presignSafe(`artifacts/${jobId}/results/bundles/visualizations.zip`, (u) => setVizZip(u));
+      await presignSafe(`${artifactBase}/results/report.html`, (u) => setReportUrl(u));
+      await presignSafe(`${artifactBase}/results/descriptive_stats.csv`, (u) => setDescCsvUrl(u));
+      await presignSafe(`${artifactBase}/results/correlations.csv`, (u) => setCorrCsvUrl(u));
+      await presignSafe(`${artifactBase}/results/outliers.json`, (u) => setOutliersUrl(u));
+      await presignSafe(`${artifactBase}/results/bundles/analytics_bundle.zip`, (u) => setAnalyticsZip(u));
+      await presignSafe(`${artifactBase}/results/bundles/visualizations.zip`, (u) => setVizZip(u));
 
       // figures
       try {
-        const figs = await listArtifacts(jobId, `artifacts/${jobId}/results/graphs/`);
+        const figs = await listArtifacts(jobId, `${artifactBase}/results/graphs/`);
         const urls: Figure[] = [];
         for (const o of figs.objects || []) {
           if (!o.key) continue;
@@ -80,7 +95,7 @@ export default function ResultsViewer({
         setFigures(urls);
       } catch { setFigures([]); }
     })();
-  }, [jobId]);
+  }, [artifactBase, jobId]);
 
   // CSV preview for descriptive_stats.csv
   useEffect(() => {
