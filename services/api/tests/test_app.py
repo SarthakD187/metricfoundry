@@ -146,7 +146,7 @@ def test_create_database_job_with_secret(api_app):
             "source_type": "database",
             "source_config": {
                 "query": "SELECT 1",
-                "secretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:database",
+                "secretArn": "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:database",
                 "secretField": "url",
             },
         },
@@ -168,7 +168,7 @@ def test_create_database_job_rejects_multiple_connections(api_app):
             "source_type": "database",
             "source_config": {
                 "url": "sqlite:///tmp/example.db",
-                "secretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:database",
+                "secretArn": "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:database",
                 "query": "SELECT 1",
             },
         },
@@ -197,7 +197,7 @@ def test_create_warehouse_job_validation(api_app):
             "source_config": {
                 "warehouseType": "snowflake",
                 "query": "SELECT 1",
-                "secretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:warehouse",
+                "secretArn": "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:warehouse",
                 "filename": "warehouse-output.csv",
             },
         },

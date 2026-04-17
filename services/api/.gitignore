@@ -1,0 +1,12 @@
+*
+!.gitignore
+!__init__.py
+!app.py
+!lambda_handler.py
+!DockerFile
+!requirements.txt
+!requirements-dev.txt
+!tests/
+!tests/**
+!bin/
+!bin/**
