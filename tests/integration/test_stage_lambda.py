@@ -77,12 +77,7 @@ def test_stage_lambda_registers_warehouse_dialects(stage_lambda, monkeypatch):
 
     monkeypatch.setattr(module.registry, "register", fake_register)
 
-    available = {
-        "snowflake.sqlalchemy",
-        "sqlalchemy_redshift.dialect",
-        "pybigquery.sqlalchemy_bigquery",
-        "databricks.sqlalchemy",
-    }
+    available = {"databricks.sqlalchemy"}
 
     def fake_import(name: str):
         if name in available:
@@ -94,11 +89,6 @@ def test_stage_lambda_registers_warehouse_dialects(stage_lambda, monkeypatch):
     module._register_sqlalchemy_dialects()
 
     expected_entries = [
-        ("snowflake", "snowflake.sqlalchemy", "dialect"),
-        ("redshift", "sqlalchemy_redshift.dialect", "RedshiftDialect_psycopg2"),
-        ("redshift+redshift_connector", "sqlalchemy_redshift.dialect", "RedshiftDialect_redshift_connector"),
-        ("bigquery", "pybigquery.sqlalchemy_bigquery", "BigQueryDialect"),
-        ("bigquery+pybigquery", "pybigquery.sqlalchemy_bigquery", "BigQueryDialect"),
         ("databricks", "databricks.sqlalchemy", "DatabricksDialect"),
         ("databricks+connector", "databricks.sqlalchemy", "DatabricksDialect"),
     ]
@@ -394,7 +384,7 @@ def test_stage_lambda_warehouse_metadata(stage_lambda, tmp_path):
             "status": "QUEUED",
             "source": {
                 "type": "warehouse",
-                "warehouseType": "snowflake",
+                "warehouseType": "databricks",
                 "url": f"sqlite:///{db_path}",
                 "query": "SELECT amount FROM warehouse_data",
             },
@@ -404,7 +394,7 @@ def test_stage_lambda_warehouse_metadata(stage_lambda, tmp_path):
     module.handler({"jobId": job_id}, None)
 
     record = fake_table.get_item({"pk": f"job#{job_id}", "sk": "meta"}).get("Item")
-    assert record["inputMetadata"]["sourceType"] == "warehouse:snowflake"
+    assert record["inputMetadata"]["sourceType"] == "warehouse:databricks"
 
 
 def test_stage_lambda_database_secret(stage_lambda, tmp_path):

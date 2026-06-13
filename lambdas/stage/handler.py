@@ -18,8 +18,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import import_module
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from urllib.parse import parse_qs, unquote, urlparse
 
 import boto3
 from botocore.exceptions import ClientError
@@ -65,33 +65,9 @@ STATUS_FAILED = "FAILED"
 
 
 def _register_sqlalchemy_dialects() -> None:
-    """Register optional warehouse dialects when their drivers are present."""
+    """Register optional SQLAlchemy dialects that still use the generic SQL path."""
 
     targets = [
-        (
-            "snowflake.sqlalchemy",
-            "snowflake.sqlalchemy",
-            "dialect",
-            ["snowflake"],
-        ),
-        (
-            "sqlalchemy_redshift.dialect",
-            "sqlalchemy_redshift.dialect",
-            "RedshiftDialect_psycopg2",
-            ["redshift"],
-        ),
-        (
-            "sqlalchemy_redshift.dialect",
-            "sqlalchemy_redshift.dialect",
-            "RedshiftDialect_redshift_connector",
-            ["redshift+redshift_connector"],
-        ),
-        (
-            "pybigquery.sqlalchemy_bigquery",
-            "pybigquery.sqlalchemy_bigquery",
-            "BigQueryDialect",
-            ["bigquery", "bigquery+pybigquery"],
-        ),
         (
             "databricks.sqlalchemy",
             "databricks.sqlalchemy",
@@ -595,8 +571,29 @@ def _secret_payload_value(raw_value: str, *, field: Optional[str]) -> str:
     return value
 
 
-def _resolve_sql_connection(source: Dict[str, object]) -> str:
-    """Return a SQLAlchemy connection URL for the provided source."""
+ConnectionPayload = Union[str, Dict[str, Any]]
+
+
+def _decode_connection_value(raw_value: str, *, field: Optional[str]) -> ConnectionPayload:
+    if field:
+        return _secret_payload_value(raw_value, field=field)
+
+    stripped = raw_value.strip()
+    if not stripped:
+        raise ValueError("Connection secret cannot be empty")
+
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return stripped
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Connection secret JSON must be an object")
+    return parsed
+
+
+def _resolve_connection_payload(source: Dict[str, object]) -> ConnectionPayload:
+    """Return inline or secret-backed connection data as either URL string or dict."""
 
     connection_meta = source.get("connection")
     if connection_meta is not None:
@@ -607,10 +604,15 @@ def _resolve_sql_connection(source: Dict[str, object]) -> str:
         secret_field = connection_meta.get("secretField")
 
         if conn_type in {"inline", "url"}:
-            url = connection_meta.get("url")
-            if not isinstance(url, str) or not url.strip():
-                raise ValueError("Inline SQL connection requires a non-empty url")
-            return url.strip()
+            if "url" in connection_meta:
+                url = connection_meta.get("url")
+                if not isinstance(url, str) or not url.strip():
+                    raise ValueError("Inline SQL connection requires a non-empty url")
+                return url.strip()
+            details = connection_meta.get("details") or connection_meta.get("config")
+            if isinstance(details, dict):
+                return dict(details)
+            raise ValueError("Inline SQL connection requires url or details")
 
         if conn_type in {"secretsmanager", "secret", "secrets"}:
             secret_arn = connection_meta.get("secretArn") or connection_meta.get("arn")
@@ -626,7 +628,7 @@ def _resolve_sql_connection(source: Dict[str, object]) -> str:
                 raw_value = base64.b64decode(response["SecretBinary"]).decode("utf-8")
             else:
                 raise ValueError(f"Secret {secret_arn} does not contain a value")
-            return _secret_payload_value(raw_value, field=secret_field)
+            return _decode_connection_value(raw_value, field=secret_field)
 
         if conn_type in {"parameterstore", "ssm", "systemsmanager"}:
             parameter_name = connection_meta.get("parameterName") or connection_meta.get("name")
@@ -640,9 +642,13 @@ def _resolve_sql_connection(source: Dict[str, object]) -> str:
             raw_value = parameter.get("Value")
             if raw_value is None:
                 raise ValueError(f"Parameter {parameter_name} does not contain a value")
-            return _secret_payload_value(raw_value, field=secret_field)
+            return _decode_connection_value(raw_value, field=secret_field)
 
         raise ValueError(f"Unsupported SQL connection type: {conn_type}")
+
+    details = source.get("connectionDetails") or source.get("credentials")
+    if isinstance(details, dict):
+        return dict(details)
 
     url = source.get("url")
     if isinstance(url, str) and url.strip():
@@ -663,7 +669,7 @@ def _resolve_sql_connection(source: Dict[str, object]) -> str:
             raw_value = base64.b64decode(response["SecretBinary"]).decode("utf-8")
         else:
             raise ValueError(f"Secret {secret_arn} does not contain a value")
-        return _secret_payload_value(raw_value, field=secret_field)
+        return _decode_connection_value(raw_value, field=secret_field)
 
     if parameter_name:
         try:
@@ -674,11 +680,25 @@ def _resolve_sql_connection(source: Dict[str, object]) -> str:
         raw_value = parameter.get("Value")
         if raw_value is None:
             raise ValueError(f"Parameter {parameter_name} does not contain a value")
-        return _secret_payload_value(raw_value, field=secret_field)
+        return _decode_connection_value(raw_value, field=secret_field)
 
     raise ValueError(
-        "SQL source requires a connection string via connection metadata, url, secretArn, or parameterName"
+        "SQL source requires connection data via connection metadata, url, secretArn, or parameterName"
     )
+
+
+def _resolve_sql_connection(source: Dict[str, object]) -> str:
+    """Return a SQLAlchemy connection URL for the provided source."""
+
+    payload = _resolve_connection_payload(source)
+    if isinstance(payload, str):
+        return payload
+
+    url = payload.get("url") or payload.get("connectionString")
+    if isinstance(url, str) and url.strip():
+        return url.strip()
+
+    raise ValueError("SQLAlchemy sources require a connection URL")
 
 
 def _extract_sql_source(
@@ -735,6 +755,310 @@ def _extract_sql_source(
     return SourceRef(ARTIFACTS_BUCKET, key)
 
 
+def _escape_sql_literal(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _connection_dict(source: Dict[str, object], *, scheme: str) -> Dict[str, Any]:
+    payload = _resolve_connection_payload(source)
+    if isinstance(payload, dict):
+        return dict(payload)
+
+    parsed = urlparse(payload)
+    if parsed.scheme and parsed.scheme.split("+", 1)[0] != scheme:
+        raise ValueError(f"Expected {scheme} connection URL")
+
+    params = {key: values[-1] for key, values in parse_qs(parsed.query).items() if values}
+    database = parsed.path.lstrip("/").split("/", 1)[0] if parsed.path else ""
+    schema = parsed.path.lstrip("/").split("/", 1)[1] if "/" in parsed.path.lstrip("/") else ""
+    details: Dict[str, Any] = dict(params)
+    if parsed.hostname:
+        details["host"] = parsed.hostname
+    if parsed.port:
+        details["port"] = parsed.port
+    if parsed.username:
+        details["user"] = unquote(parsed.username)
+    if parsed.password:
+        details["password"] = unquote(parsed.password)
+    if database:
+        details["database"] = unquote(database)
+    if schema:
+        details["schema"] = unquote(schema)
+    return details
+
+
+def _connect_redshift(**kwargs):
+    try:
+        redshift_connector = import_module("redshift_connector")
+    except ImportError as exc:
+        raise ValueError("redshift_connector is required for Redshift warehouse exports") from exc
+    return redshift_connector.connect(**kwargs)
+
+
+def _connect_snowflake(**kwargs):
+    try:
+        snowflake_connector = import_module("snowflake.connector")
+    except ImportError as exc:
+        raise ValueError("snowflake-connector-python is required for Snowflake warehouse exports") from exc
+    return snowflake_connector.connect(**kwargs)
+
+
+def _bigquery_clients(source: Dict[str, object], connection: Dict[str, Any]):
+    try:
+        bigquery = import_module("google.cloud.bigquery")
+        bigquery_storage = import_module("google.cloud.bigquery_storage")
+    except ImportError as exc:
+        raise ValueError(
+            "google-cloud-bigquery and google-cloud-bigquery-storage are required for BigQuery warehouse reads"
+        ) from exc
+
+    project = (
+        source.get("project")
+        or source.get("projectId")
+        or connection.get("project")
+        or connection.get("project_id")
+    )
+    client_kwargs = {"project": project} if project else {}
+    return bigquery.Client(**client_kwargs), bigquery_storage.BigQueryReadClient(), bigquery, bigquery_storage
+
+
+def _list_s3_keys(bucket: str, prefix: str) -> List[str]:
+    if hasattr(s3, "list_keys"):
+        return list(s3.list_keys(Bucket=bucket, Prefix=prefix))
+
+    keys: List[str] = []
+    continuation: Dict[str, Any] = {}
+    while True:
+        response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, **continuation)
+        keys.extend(entry["Key"] for entry in response.get("Contents", []))
+        if not response.get("IsTruncated"):
+            break
+        continuation = {"ContinuationToken": response["NextContinuationToken"]}
+    return sorted(keys)
+
+
+def _copy_first_native_export(prefix: str, final_key: str) -> SourceRef:
+    candidates = [
+        key
+        for key in _list_s3_keys(ARTIFACTS_BUCKET, prefix)
+        if not key.endswith("/") and not key.endswith("manifest") and not key.endswith("manifest.json")
+    ]
+    if not candidates:
+        raise ValueError("Warehouse native export completed without producing an S3 object")
+
+    s3.copy_object(
+        Bucket=ARTIFACTS_BUCKET,
+        Key=final_key,
+        CopySource={"Bucket": ARTIFACTS_BUCKET, "Key": candidates[0]},
+    )
+    return SourceRef(ARTIFACTS_BUCKET, final_key)
+
+
+def _redshift_unload_source(job_id: str, artifact_prefix: str, source: Dict[str, object]) -> SourceRef:
+    query = source.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("Redshift warehouse source requires a query")
+
+    filename = _safe_filename(source.get("filename"), "redshift-export.csv")
+    final_key = f"{artifact_prefix}/input/{filename}"
+    export_prefix = f"{artifact_prefix}/native/redshift/{job_id}-"
+    role = source.get("unloadIamRole") or source.get("iamRole") or source.get("roleArn")
+    if not isinstance(role, str) or not role.strip():
+        raise ValueError("Redshift UNLOAD requires unloadIamRole, iamRole, or roleArn")
+
+    options = str(source.get("unloadOptions") or "FORMAT AS CSV HEADER ALLOWOVERWRITE PARALLEL OFF")
+    statement = (
+        f"UNLOAD ('{_escape_sql_literal(query)}') "
+        f"TO 's3://{ARTIFACTS_BUCKET}/{export_prefix}' "
+        f"IAM_ROLE '{_escape_sql_literal(role)}' {options}"
+    )
+
+    connection = _connect_redshift(**_connection_dict(source, scheme="redshift"))
+    try:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(statement)
+            if hasattr(connection, "commit"):
+                connection.commit()
+        finally:
+            if hasattr(cursor, "close"):
+                cursor.close()
+    finally:
+        if hasattr(connection, "close"):
+            connection.close()
+
+    return _copy_first_native_export(export_prefix, final_key)
+
+
+def _snowflake_copy_into_source(job_id: str, artifact_prefix: str, source: Dict[str, object]) -> SourceRef:
+    query = source.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("Snowflake warehouse source requires a query")
+
+    filename = _safe_filename(source.get("filename"), "snowflake-export.csv")
+    final_key = f"{artifact_prefix}/input/{filename}"
+    export_prefix = f"{artifact_prefix}/native/snowflake/{job_id}"
+    connection_details = _connection_dict(source, scheme="snowflake")
+
+    integration = source.get("storageIntegration") or connection_details.pop("storageIntegration", None)
+    credentials = source.get("s3Credentials") or connection_details.pop("s3Credentials", None)
+    stage_auth = ""
+    if isinstance(integration, str) and integration.strip():
+        stage_auth = f" STORAGE_INTEGRATION = {_escape_sql_literal(integration).upper()}"
+    elif isinstance(credentials, dict):
+        access_key = credentials.get("awsKeyId") or credentials.get("aws_access_key_id")
+        secret_key = credentials.get("awsSecretKey") or credentials.get("aws_secret_access_key")
+        token = credentials.get("awsToken") or credentials.get("aws_session_token")
+        if not access_key or not secret_key:
+            raise ValueError("Snowflake s3Credentials require awsKeyId and awsSecretKey")
+        token_fragment = f" AWS_TOKEN='{_escape_sql_literal(str(token))}'" if token else ""
+        stage_auth = (
+            " CREDENTIALS=("
+            f"AWS_KEY_ID='{_escape_sql_literal(str(access_key))}' "
+            f"AWS_SECRET_KEY='{_escape_sql_literal(str(secret_key))}'"
+            f"{token_fragment})"
+        )
+    else:
+        raise ValueError("Snowflake COPY INTO S3 requires storageIntegration or s3Credentials")
+
+    stage_name = f"metricfoundry_{job_id.replace('-', '_')}_stage"
+    stage_url = f"s3://{ARTIFACTS_BUCKET}/{export_prefix}/"
+    file_format = str(
+        source.get("copyFileFormat")
+        or "TYPE = CSV FIELD_OPTIONALLY_ENCLOSED_BY = '\"' COMPRESSION = NONE"
+    )
+    copy_options = str(source.get("copyOptions") or "HEADER = TRUE SINGLE = TRUE OVERWRITE = TRUE")
+
+    connection = _connect_snowflake(**connection_details)
+    try:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                f"CREATE OR REPLACE TEMPORARY STAGE {stage_name} URL='{_escape_sql_literal(stage_url)}'{stage_auth}"
+            )
+            cursor.execute(
+                f"COPY INTO @{stage_name}/{_escape_sql_literal(filename)} "
+                f"FROM ({query}) FILE_FORMAT = ({file_format}) {copy_options}"
+            )
+        finally:
+            if hasattr(cursor, "close"):
+                cursor.close()
+    finally:
+        if hasattr(connection, "close"):
+            connection.close()
+
+    return _copy_first_native_export(export_prefix, final_key)
+
+
+def _write_bigquery_rows(
+    rows: Iterable[Any],
+    schema_fields: Sequence[Any],
+    key: str,
+    export_format: str,
+) -> SourceRef:
+    if export_format == "jsonl":
+        lines = []
+        for row in rows:
+            if hasattr(row, "items"):
+                payload = dict(row.items())
+            elif isinstance(row, dict):
+                payload = row
+            else:
+                payload = dict(row)
+            lines.append(json.dumps(payload, default=_json_default))
+        body = "\n".join(lines).encode("utf-8")
+        content_type = "application/json"
+    else:
+        columns = [field.name for field in schema_fields]
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(columns)
+        for row in rows:
+            if hasattr(row, "get"):
+                writer.writerow([row.get(column) for column in columns])
+            elif isinstance(row, dict):
+                writer.writerow([row.get(column) for column in columns])
+            else:
+                writer.writerow([getattr(row, column, "") for column in columns])
+        body = buffer.getvalue().encode("utf-8")
+        content_type = "text/csv"
+
+    s3.put_object(Bucket=ARTIFACTS_BUCKET, Key=key, Body=body, ContentType=content_type)
+    return SourceRef(ARTIFACTS_BUCKET, key)
+
+
+def _bigquery_storage_read_source(job_id: str, artifact_prefix: str, source: Dict[str, object]) -> SourceRef:
+    connection_payload = _resolve_connection_payload(source)
+    connection = connection_payload if isinstance(connection_payload, dict) else {}
+    bq_client, read_client, bigquery, bigquery_storage = _bigquery_clients(source, connection)
+
+    filename = _safe_filename(source.get("filename"), "bigquery-export.csv")
+    export_format = str(source.get("format") or "csv").lower()
+    if export_format not in {"csv", "jsonl"}:
+        raise ValueError("BigQuery export format must be 'csv' or 'jsonl'")
+    final_key = f"{artifact_prefix}/input/{filename}"
+
+    table_ref = source.get("table") or source.get("tableId")
+    query = source.get("query")
+    if isinstance(query, str) and query.strip():
+        job_config = getattr(bigquery, "QueryJobConfig", lambda **kwargs: kwargs)(
+            use_legacy_sql=bool(source.get("useLegacySql", False))
+        )
+        query_job = bq_client.query(query, job_config=job_config)
+        query_job.result()
+        table_ref = query_job.destination
+
+    if not table_ref:
+        dataset = source.get("dataset") or source.get("datasetId")
+        table = source.get("tableName") or source.get("table")
+        project = source.get("project") or source.get("projectId") or connection.get("project") or connection.get("project_id")
+        if not dataset or not table:
+            raise ValueError("BigQuery warehouse source requires query or table metadata")
+        table_ref = f"{project}.{dataset}.{table}" if project else f"{dataset}.{table}"
+
+    table = bq_client.get_table(table_ref)
+    parent = f"projects/{bq_client.project}"
+    table_path = f"projects/{table.project}/datasets/{table.dataset_id}/tables/{table.table_id}"
+    read_options = bigquery_storage.types.ReadSession.TableReadOptions()
+    selected_fields = source.get("selectedFields")
+    if isinstance(selected_fields, list):
+        read_options.selected_fields = [str(field) for field in selected_fields]
+    row_restriction = source.get("rowRestriction")
+    if isinstance(row_restriction, str) and row_restriction.strip():
+        read_options.row_restriction = row_restriction
+
+    read_session = bigquery_storage.types.ReadSession(
+        table=table_path,
+        data_format=bigquery_storage.types.DataFormat.ARROW,
+        read_options=read_options,
+    )
+    session = read_client.create_read_session(
+        parent=parent,
+        read_session=read_session,
+        max_stream_count=int(source.get("maxStreamCount") or 1),
+    )
+
+    rows: List[Any] = []
+    for stream in session.streams:
+        reader = read_client.read_rows(stream.name)
+        rows.extend(reader.rows(session))
+
+    return _write_bigquery_rows(rows, table.schema, final_key, export_format)
+
+
+def _extract_warehouse_source(job_id: str, artifact_prefix: str, source: Dict[str, object]) -> Tuple[SourceRef, str]:
+    warehouse_type = str(source.get("warehouseType") or "warehouse").lower()
+    if warehouse_type == "redshift":
+        return _redshift_unload_source(job_id, artifact_prefix, source), "warehouse:redshift"
+    if warehouse_type == "snowflake":
+        return _snowflake_copy_into_source(job_id, artifact_prefix, source), "warehouse:snowflake"
+    if warehouse_type == "bigquery":
+        return _bigquery_storage_read_source(job_id, artifact_prefix, source), "warehouse:bigquery"
+
+    ref = _extract_sql_source(job_id, artifact_prefix, source, default_name=f"{warehouse_type}-export.csv")
+    return ref, f"warehouse:{warehouse_type}"
+
+
 def _resolve_source(job_id: str, artifact_prefix: str, item: Dict[str, Dict]) -> Tuple[object, str]:
     source = item.get("source") or {}
     source_type = source.get("type")
@@ -764,9 +1088,7 @@ def _resolve_source(job_id: str, artifact_prefix: str, item: Dict[str, Dict]) ->
         return ref, source_type
 
     if source_type == "warehouse":
-        warehouse_type = source.get("warehouseType") or "warehouse"
-        ref = _extract_sql_source(job_id, artifact_prefix, source, default_name=f"{warehouse_type}-export.csv")
-        return ref, f"warehouse:{warehouse_type}"
+        return _extract_warehouse_source(job_id, artifact_prefix, source)
 
     raise ValueError(f"Unsupported source type: {source_type}")
 

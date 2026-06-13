@@ -535,7 +535,7 @@ def test_handler_warehouse_sqlite_fallback(stage_module, monkeypatch, tmp_path):
     job_id = "job-warehouse"
     _seed_job(table, job_id, {
         "type": "warehouse",
-        "warehouseType": "snowflake",
+        "warehouseType": "databricks",
         "url": f"sqlite:///{db_path}",
         "query": "SELECT amount FROM wh",
     })
@@ -543,7 +543,214 @@ def test_handler_warehouse_sqlite_fallback(stage_module, monkeypatch, tmp_path):
     monkeypatch.setattr(stage_module, "ddb", ddb)
 
     result = stage_module.handler({"jobId": job_id}, None)
+    assert result["metadata"]["sourceType"] == "warehouse:databricks"
+
+
+@mock_aws
+def test_handler_warehouse_redshift_uses_unload(stage_module, monkeypatch):
+    ddb = boto3.resource("dynamodb", region_name=REGION)
+    s3 = boto3.client("s3", region_name=REGION)
+    table = _create_aws_resources(ddb, s3)
+    executed = []
+
+    class _Cursor:
+        def execute(self, statement):
+            executed.append(statement)
+            s3.put_object(
+                Bucket=BUCKET,
+                Key="artifacts/job-redshift/native/redshift/job-redshift-000",
+                Body=b"id,value\n1,10\n",
+                ContentType="text/csv",
+            )
+
+        def close(self):
+            pass
+
+    class _Connection:
+        def cursor(self):
+            return _Cursor()
+
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(stage_module, "_connect_redshift", lambda **kwargs: _Connection())
+    monkeypatch.setattr(stage_module, "s3", s3)
+    monkeypatch.setattr(stage_module, "ddb", ddb)
+
+    job_id = "job-redshift"
+    _seed_job(table, job_id, {
+        "type": "warehouse",
+        "warehouseType": "redshift",
+        "url": "redshift://user:pass@example.abc.us-east-1.redshift.amazonaws.com:5439/dev",
+        "query": "SELECT id, value FROM metrics",
+        "unloadIamRole": "arn:aws:iam::123456789012:role/redshift-unload",
+        "filename": "metrics.csv",
+    })
+
+    result = stage_module.handler({"jobId": job_id}, None)
+
+    assert "UNLOAD" in executed[0]
+    assert "IAM_ROLE" in executed[0]
+    assert result["metadata"]["sourceType"] == "warehouse:redshift"
+    obj = s3.get_object(Bucket=BUCKET, Key="artifacts/job-redshift/input/metrics.csv")
+    assert obj["Body"].read() == b"id,value\n1,10\n"
+
+
+@mock_aws
+def test_handler_warehouse_snowflake_uses_copy_into(stage_module, monkeypatch):
+    ddb = boto3.resource("dynamodb", region_name=REGION)
+    s3 = boto3.client("s3", region_name=REGION)
+    table = _create_aws_resources(ddb, s3)
+    executed = []
+
+    class _Cursor:
+        def execute(self, statement):
+            executed.append(statement)
+            if statement.startswith("COPY INTO"):
+                s3.put_object(
+                    Bucket=BUCKET,
+                    Key="artifacts/job-snowflake/native/snowflake/job-snowflake/export.csv",
+                    Body=b"amount\n7\n",
+                    ContentType="text/csv",
+                )
+
+        def close(self):
+            pass
+
+    class _Connection:
+        def cursor(self):
+            return _Cursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(stage_module, "_connect_snowflake", lambda **kwargs: _Connection())
+    monkeypatch.setattr(stage_module, "s3", s3)
+    monkeypatch.setattr(stage_module, "ddb", ddb)
+
+    job_id = "job-snowflake"
+    _seed_job(table, job_id, {
+        "type": "warehouse",
+        "warehouseType": "snowflake",
+        "connectionDetails": {
+            "account": "acct",
+            "user": "user",
+            "password": "pass",
+            "database": "db",
+        },
+        "storageIntegration": "metricfoundry_s3_int",
+        "query": "SELECT amount FROM warehouse_data",
+        "filename": "export.csv",
+    })
+
+    result = stage_module.handler({"jobId": job_id}, None)
+
+    assert executed[0].startswith("CREATE OR REPLACE TEMPORARY STAGE")
+    assert executed[1].startswith("COPY INTO")
+    assert "FILE_FORMAT" in executed[1]
     assert result["metadata"]["sourceType"] == "warehouse:snowflake"
+    obj = s3.get_object(Bucket=BUCKET, Key="artifacts/job-snowflake/input/export.csv")
+    assert obj["Body"].read() == b"amount\n7\n"
+
+
+@mock_aws
+def test_handler_warehouse_bigquery_uses_storage_read(stage_module, monkeypatch):
+    ddb = boto3.resource("dynamodb", region_name=REGION)
+    s3 = boto3.client("s3", region_name=REGION)
+    table = _create_aws_resources(ddb, s3)
+
+    class _Field:
+        def __init__(self, name):
+            self.name = name
+
+    class _Table:
+        project = "proj"
+        dataset_id = "dataset"
+        table_id = "table"
+        schema = [_Field("id"), _Field("value")]
+
+    class _QueryJob:
+        destination = "proj.dataset.temp_table"
+
+        def result(self):
+            return None
+
+    class _BQClient:
+        project = "proj"
+
+        def query(self, query, job_config=None):
+            self.query_text = query
+            return _QueryJob()
+
+        def get_table(self, table_ref):
+            self.table_ref = table_ref
+            return _Table()
+
+    class _ReadOptions:
+        selected_fields = []
+        row_restriction = ""
+
+    class _ReadSession:
+        class TableReadOptions(_ReadOptions):
+            pass
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class _Types:
+        class DataFormat:
+            ARROW = "ARROW"
+
+        ReadSession = _ReadSession
+
+    class _BQModule:
+        @staticmethod
+        def QueryJobConfig(**kwargs):
+            return kwargs
+
+    class _StorageModule:
+        ReadSession = _ReadSession
+        types = _Types
+
+    class _Stream:
+        name = "stream-1"
+
+    class _Session:
+        streams = [_Stream()]
+
+    class _Reader:
+        def rows(self, session):
+            return [{"id": 1, "value": "alpha"}, {"id": 2, "value": "beta"}]
+
+    class _ReadClient:
+        def create_read_session(self, **kwargs):
+            self.kwargs = kwargs
+            return _Session()
+
+        def read_rows(self, stream_name):
+            return _Reader()
+
+    monkeypatch.setattr(stage_module, "_bigquery_clients", lambda source, connection: (_BQClient(), _ReadClient(), _BQModule, _StorageModule))
+    monkeypatch.setattr(stage_module, "s3", s3)
+    monkeypatch.setattr(stage_module, "ddb", ddb)
+
+    job_id = "job-bigquery"
+    _seed_job(table, job_id, {
+        "type": "warehouse",
+        "warehouseType": "bigquery",
+        "connectionDetails": {"project": "proj"},
+        "query": "SELECT id, value FROM dataset.table",
+        "filename": "bq.csv",
+    })
+
+    result = stage_module.handler({"jobId": job_id}, None)
+
+    assert result["metadata"]["sourceType"] == "warehouse:bigquery"
+    obj = s3.get_object(Bucket=BUCKET, Key="artifacts/job-bigquery/input/bq.csv")
+    assert obj["Body"].read().decode() == "id,value\r\n1,alpha\r\n2,beta\r\n"
 
 
 # ---------------------------------------------------------------------------
