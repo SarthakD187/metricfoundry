@@ -189,7 +189,9 @@ export class MetricFoundryCoreStack extends Stack {
     }
 
     const processorFn = new lambda.DockerImageFunction(this, "ProcessorFn", {
-      code: lambda.DockerImageCode.fromImageAsset("lambdas/processor"), // path directly to folder
+      code: lambda.DockerImageCode.fromImageAsset(".", {
+        file: "lambdas/processor/Dockerfile",
+      }), // path directly to folder
       timeout: Duration.minutes(15),
       memorySize: 3008,
       environment: processorEnv,

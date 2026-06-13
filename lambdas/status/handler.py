@@ -32,7 +32,8 @@ def handler(event: Mapping[str, Any], _context: Any) -> Dict[str, str]:
 
     if error:
         expr_vals[":e"] = str(error)[:1000]
-        update_parts.append("error = :e")
+        expr_names["#err"] = "error"
+        update_parts.append("#err = :e")
 
     try:
         _table().update_item(

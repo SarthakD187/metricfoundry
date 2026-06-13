@@ -89,11 +89,8 @@ export class MetricFoundryAuthStack extends Stack {
     if (explicit) {
       return this.sanitiseDomainPrefix(explicit);
     }
-    const base = `${Stack.of(this).stackName}-${this.account ?? "acct"}-${this.region ?? "region"}`;
-    const sanitized = this.sanitiseDomainPrefix(base);
     const suffix = this.node.addr.slice(-6);
-    const merged = `${sanitized}-${suffix}`;
-    return merged.slice(0, 63);
+    return `metricfoundry-${suffix}`;
   }
 
   private sanitiseDomainPrefix(value: string): string {

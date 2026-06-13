@@ -133,7 +133,9 @@ def _ddb_update(job_id: str, status: str, **attrs) -> None:
     for key, value in attrs.items():
         placeholder = f":{key}"
         expr_vals[placeholder] = value
-        set_expr.append(f"{key} = {placeholder}")
+        alias = f"#{key}"
+        expr_names[alias] = key
+        set_expr.append(f"{alias} = {placeholder}")
 
     _table().update_item(
         Key={"pk": f"job#{job_id}", "sk": "meta"},

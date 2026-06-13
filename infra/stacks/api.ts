@@ -64,7 +64,6 @@ export class MetricFoundryApiStack extends Stack {
         allowMethods: [apigwv2.CorsHttpMethod.ANY],
         allowHeaders: [
           "Authorization",
-          "authorization",
           "content-type",
           "x-amz-date",
           "x-amz-security-token",

@@ -62,7 +62,9 @@ def ddb_upsert_status(job_id: str, status: str, **attrs) -> None:
     for k, v in attrs.items():
         placeholder = f":{k}"
         expr_vals[placeholder] = v
-        set_clauses.append(f"{k} = {placeholder}")
+        alias = f"#{k}"
+        expr_names[alias] = k
+        set_clauses.append(f"{alias} = {placeholder}")
 
     ddb_table().update_item(
         Key={"pk": f"job#{job_id}", "sk": "meta"},
