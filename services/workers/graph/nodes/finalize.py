@@ -46,7 +46,20 @@ def finalize_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
             "message": "Automated modeling did not execute for this dataset.",
         }
 
-    artifact_prefix: str = state.get("artifact_prefix", "artifacts")
+    artifact_prefix_raw = state.get("artifact_prefix") or state.get("artifactPrefix")
+    job_identifier_raw = state.get("job_id") or state.get("jobId")
+    job_identifier = job_identifier_raw.strip() if isinstance(job_identifier_raw, str) else ""
+
+    if isinstance(artifact_prefix_raw, str):
+        artifact_prefix = artifact_prefix_raw.strip()
+    else:
+        artifact_prefix = ""
+
+    if not artifact_prefix:
+        artifact_prefix = f"artifacts/{job_identifier}" if job_identifier else "artifacts"
+
+    if artifact_prefix.strip() == "artifacts" and job_identifier:
+        artifact_prefix = f"artifacts/{job_identifier}"
     existing_artifacts: Dict[str, Dict[str, Any]] = dict(state.get("artifact_contents", {}))
     bundle_artifacts = _build_curated_bundles(phases, existing_artifacts)
     artifact_contents = dict(existing_artifacts)
@@ -67,14 +80,17 @@ def finalize_node(state: MutableMapping[str, Any]) -> Dict[str, Any]:
 
     manifest_entries.extend(_manifest_entries_for_artifacts(artifact_contents, artifact_prefix))
 
-    manifest_entries.append(
-        {
-            "name": "results_json",
-            "description": "Consolidated analytics results payload.",
-            "contentType": "application/json",
-            "key": f"{artifact_prefix}/results/results.json",
-        }
-    )
+    if not any(
+        entry.get("key", "").endswith("/results/results.json") for entry in manifest_entries
+    ):
+        manifest_entries.append(
+            {
+                "name": "results_json",
+                "description": "Consolidated analytics results payload.",
+                "contentType": "application/json",
+                "key": f"{artifact_prefix}/results/results.json",
+            }
+        )
     manifest_entries.append(
         {
             "name": "results_manifest",

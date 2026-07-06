@@ -9,6 +9,8 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as sfn from "aws-cdk-lib/aws-stepfunctions";
 import * as tasks from "aws-cdk-lib/aws-stepfunctions-tasks";
+import * as ecr from "aws-cdk-lib/aws-ecr";
+import * as ssm from "aws-cdk-lib/aws-ssm";
 
 /** Prefer local python/pip bundling to avoid Docker. Falls back to Docker if local fails. */
 function pyLocalBundling(entryDir: string, extraDirs: string[] = []) {
@@ -161,12 +163,52 @@ export class MetricFoundryCoreStack extends Stack {
     // Processor Lambda: runs analytics pipeline after staging completes
     // Copies repo-local `services/` into the bundle so imports work.
     // =====================================================================
-    const workerInvokeMode =
+    let workerInvokeMode =
       (this.node.tryGetContext("workerInvokeMode") as string | undefined) ?? "embedded";
-    const workerArn = this.node.tryGetContext("workerArn") as string | undefined;
+    let workerArn = this.node.tryGetContext("workerArn") as string | undefined;
     const workerUrl = this.node.tryGetContext("workerUrl") as string | undefined;
     const workerAuthHeader = this.node.tryGetContext("workerAuthHeader") as string | undefined;
     const workerBearerToken = this.node.tryGetContext("workerBearerToken") as string | undefined;
+
+    const workerImageTagParameter = process.env.WORKER_IMAGE_TAG_PARAMETER;
+    const workerRepositoryName = process.env.WORKER_ECR_REPOSITORY;
+    let graphWorkerFn: lambda.DockerImageFunction | undefined;
+
+    if (!workerArn && workerImageTagParameter && workerRepositoryName) {
+      const workerRepository = ecr.Repository.fromRepositoryName(
+        this,
+        "GraphWorkerRepository",
+        workerRepositoryName
+      );
+      const workerImageTag = ssm.StringParameter.fromStringParameterName(
+        this,
+        "GraphWorkerImageTag",
+        workerImageTagParameter
+      );
+
+      graphWorkerFn = new lambda.DockerImageFunction(this, "GraphWorkerFn", {
+        code: lambda.DockerImageCode.fromEcr(workerRepository, {
+          tagOrDigest: workerImageTag.stringValue,
+        }),
+        timeout: Duration.minutes(15),
+        memorySize: 4096,
+        architecture: lambda.Architecture.X86_64,
+        environment: {
+          TABLE_NAME: this.jobsTable.tableName,
+          JOBS_TABLE: this.jobsTable.tableName,
+          ARTIFACTS_BUCKET: this.artifacts.bucketName,
+        },
+        ephemeralStorageSize: Size.mebibytes(10240),
+      });
+
+      this.artifacts.grantReadWrite(graphWorkerFn);
+      this.jobsTable.grantReadWriteData(graphWorkerFn);
+      workerArn = graphWorkerFn.functionArn;
+
+      if (!this.node.tryGetContext("workerInvokeMode")) {
+        workerInvokeMode = "lambda";
+      }
+    }
 
     const processorEnv: Record<string, string> = {
       JOBS_TABLE: this.jobsTable.tableName,
@@ -198,13 +240,17 @@ export class MetricFoundryCoreStack extends Stack {
       ephemeralStorageSize: Size.mebibytes(10240),
     });
 
-    if (workerArn) {
-      processorFn.addToRolePolicy(
-        new iam.PolicyStatement({
-          actions: ["lambda:InvokeFunction", "lambda:InvokeAsync"],
-          resources: [workerArn],
-        })
-      );
+    if (workerArn && workerInvokeMode === "lambda") {
+      if (graphWorkerFn) {
+        graphWorkerFn.grantInvoke(processorFn);
+      } else {
+        processorFn.addToRolePolicy(
+          new iam.PolicyStatement({
+            actions: ["lambda:InvokeFunction"],
+            resources: [workerArn],
+          })
+        );
+      }
     }
 
     this.artifacts.grantReadWrite(processorFn);

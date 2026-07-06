@@ -1,0 +1,153 @@
+name: Dashboard CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dashboard/**'
+      - '.github/workflows/dashboard.yml'
+  pull_request:
+    paths:
+      - 'dashboard/**'
+      - '.github/workflows/dashboard.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  build:
+    name: Build dashboard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      build-path: ${{ steps.export.outputs.build-path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'dashboard/package-lock.json'
+
+      - name: Install dependencies
+        run: npm ci --prefix dashboard
+
+      - name: Lint dashboard
+        run: npm run lint --prefix dashboard
+
+      - name: Build dashboard
+        env:
+          NEXT_PUBLIC_API_URL: ${{ secrets.DASHBOARD_API_URL || vars.NEXT_PUBLIC_API_URL }}
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: npm run build --prefix dashboard
+
+      - name: Export static site
+        id: export
+        env:
+          NEXT_PUBLIC_API_URL: ${{ secrets.DASHBOARD_API_URL || vars.NEXT_PUBLIC_API_URL }}
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: |
+          cd dashboard
+          npx next export
+          echo "build-path=$(pwd)/out" >> "$GITHUB_OUTPUT"
+
+      - name: Upload static artifact
+        id: static
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-static
+          path: ${{ steps.export.outputs.build-path }}
+          if-no-files-found: error
+
+      - name: Build summary
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          ARTIFACT_ID: ${{ steps.static.outputs.artifact-id || '' }}
+        with:
+          script: |
+            let artifactLink = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            if (process.env.ARTIFACT_ID) {
+              const artifact = await github.rest.actions.getArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: Number(process.env.ARTIFACT_ID),
+              });
+              artifactLink = artifact.data.archive_download_url;
+            }
+            await core.summary
+              .addHeading('Dashboard build')
+              .addList([
+                'npm ci',
+                'next lint',
+                'next build',
+                'next export',
+              ])
+              .addLink('Download static export', artifactLink)
+              .write({ append: true });
+
+  deploy:
+    name: Deploy dashboard
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download static artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dashboard-static
+          path: dashboard-out
+
+      - name: Sync to S3
+        run: |
+          BUCKET=${{ secrets.DASHBOARD_BUCKET }}
+          if [[ "$BUCKET" != s3://* ]]; then
+            BUCKET="s3://$BUCKET"
+          fi
+          aws s3 sync dashboard-out/ "$BUCKET" --delete
+
+      - name: Invalidate CloudFront
+        if: secrets.DASHBOARD_CLOUDFRONT_DISTRIBUTION_ID != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.DASHBOARD_CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths '/*'
+
+      - name: Deployment summary
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          DASHBOARD_URL: ${{ secrets.DASHBOARD_CLOUDFRONT_URL || '' }}
+          DASHBOARD_BUCKET: ${{ secrets.DASHBOARD_BUCKET || '' }}
+        with:
+          script: |
+            const summary = core.summary.addHeading('Dashboard deployment');
+            const url = process.env.DASHBOARD_URL;
+            if (url) {
+              summary.addLink('View dashboard', url);
+            } else if (process.env.DASHBOARD_BUCKET) {
+              summary.addRaw(`Synced to bucket: ${process.env.DASHBOARD_BUCKET}\n`, true);
+            }
+            await summary.write({ append: true });

@@ -307,7 +307,7 @@ def _as_mapping(obj: Any) -> Dict[str, Any]:
 def run_pipeline(
     job_id: str,
     source: Mapping[str, Any],
-    artifact_prefix: str,
+    artifact_prefix: Optional[str],
     body: BinaryInput,
     *,
     on_phase: PhaseCallback = None,
@@ -324,12 +324,18 @@ def run_pipeline(
         else:
             body_bytes = _to_bytes(body)
 
+    normalized_prefix = (artifact_prefix or "").strip()
+    if not normalized_prefix:
+        normalized_prefix = f"artifacts/{job_id}"
+
     initial_state: Dict[str, Any] = {
         "job_id": job_id,
+        "jobId": job_id,
         "source": dict(source),
         # keep legacy key; ingest_node supports body/raw_input
         "raw_input": body_bytes,
-        "artifact_prefix": artifact_prefix,
+        "artifact_prefix": normalized_prefix,
+        "artifactPrefix": normalized_prefix,
         "phase_outputs": {},
         "artifact_contents": {},
     }
